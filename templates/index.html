@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CollabHub</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #e2e5ea; --text: #1b1f27;
+    --muted: #6b7280; --accent: #6d5efc;
+    --open: #64748b; --claimed: #d97706; --in_progress: #2563eb;
+    --blocked: #dc2626; --done: #16a34a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161c; --panel: #1c1f28; --border: #2a2e3a; --text: #e7e9ee;
+      --muted: #8b92a3; --accent: #9b8bff;
+      --open: #8b95a8; --claimed: #f2a93b; --in_progress: #5b9bff;
+      --blocked: #ff6b6b; --done: #3ecf6e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, "Segoe UI", Inter, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 18px 24px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--done);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--done) 25%, transparent);
+    margin-left: auto;
+  }
+  main {
+    display: grid; grid-template-columns: 1fr 340px; gap: 20px;
+    padding: 20px 24px; align-items: start;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .board { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  @media (max-width: 1200px) { .board { grid-template-columns: repeat(2, 1fr); } }
+  .col h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--muted); margin: 0 0 10px 2px; display: flex; align-items: center; gap: 6px;
+  }
+  .col h2 .count {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 0 7px; font-size: 11px; color: var(--text);
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px; margin-bottom: 10px;
+  }
+  .card .title { font-weight: 600; margin-bottom: 4px; }
+  .card .desc { color: var(--muted); font-size: 12.5px; margin-bottom: 8px; white-space: pre-wrap; }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 11.5px; color: var(--muted); }
+  .badge {
+    display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px;
+    font-weight: 600; color: #fff;
+  }
+  .badge.open { background: var(--open); }
+  .badge.claimed { background: var(--claimed); }
+  .badge.in_progress { background: var(--in_progress); }
+  .badge.blocked { background: var(--blocked); }
+  .badge.done { background: var(--done); }
+  .assignee {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    color: var(--accent); padding: 1px 8px; border-radius: 999px; font-weight: 600;
+  }
+  .comments { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 6px; }
+  .comment { font-size: 12px; margin-bottom: 4px; }
+  .comment b { color: var(--accent); }
+  .empty { color: var(--muted); font-size: 12.5px; padding: 8px 2px; }
+  .notes-panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px;
+  }
+  .notes-panel h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 10px;
+  }
+  .note { padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .note:last-child { border-bottom: none; }
+  .note .head { font-size: 11.5px; color: var(--muted); margin-bottom: 2px; }
+  .note .head b { color: var(--text); }
+  .note .text { font-size: 13px; white-space: pre-wrap; }
+  time { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CollabHub</h1>
+  <span class="sub">shared task board + notes &mdash; Claude &amp; OpenClaw</span>
+  <span class="dot" id="dot"></span>
+</header>
+<main>
+  <div class="board" id="board"></div>
+  <div class="notes-panel">
+    <h2>Shared notes</h2>
+    <div id="notes"></div>
+  </div>
+</main>
+<script>
+const COLUMNS = [
+  ["open", "Open"],
+  ["claimed", "Claimed"],
+  ["in_progress", "In progress"],
+  ["blocked", "Blocked"],
+];
+// "done" tasks are folded into the last column's bottom via a 5th visual
+// group only if present, to keep the board from permanently reserving a
+// 5th column once things start finishing.
+function fmtTime(iso) {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  } catch { return iso; }
+}
+function esc(s) {
+  return (s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+function taskCard(t) {
+  const comments = (t.comments || []);
+  return `
+    <div class="card">
+      <div class="title">#${t.id} ${esc(t.title)}</div>
+      ${t.description ? `<div class="desc">${esc(t.description)}</div>` : ""}
+      <div class="meta">
+        <span class="badge ${t.status}">${t.status.replace("_"," ")}</span>
+        ${t.assignee ? `<span class="assignee">${esc(t.assignee)}</span>` : ""}
+        <span>by ${esc(t.created_by || "?")}</span>
+        <time>${fmtTime(t.updated_at)}</time>
+      </div>
+    </div>`;
+}
+async function refresh() {
+  let data;
+  try {
+    const res = await fetch("/api/state", { cache: "no-store" });
+    data = await res.json();
+    document.getElementById("dot").style.background = "var(--done)";
+  } catch (e) {
+    document.getElementById("dot").style.background = "var(--blocked)";
+    return;
+  }
+  const tasks = data.tasks || [];
+  const board = document.getElementById("board");
+  const groups = { open: [], claimed: [], in_progress: [], blocked: [], done: [] };
+  for (const t of tasks) (groups[t.status] || groups.open).push(t);
+
+  const cols = [...COLUMNS];
+  if (groups.done.length) cols.push(["done", "Done"]);
+
+  board.innerHTML = cols.map(([key, label]) => `
+    <div class="col">
+      <h2>${label} <span class="count">${groups[key].length}</span></h2>
+      ${groups[key].length ? groups[key].map(taskCard).join("") : `<div class="empty">nothing here</div>`}
+    </div>
+  `).join("");
+
+  const notes = data.notes || [];
+  document.getElementById("notes").innerHTML = notes.length
+    ? notes.map(n => `
+        <div class="note">
+          <div class="head"><b>${esc(n.author || "?")}</b> &middot; <time>${fmtTime(n.created_at)}</time></div>
+          <div class="text">${esc(n.text)}</div>
+        </div>`).join("")
+    : `<div class="empty">no notes yet</div>`;
+}
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

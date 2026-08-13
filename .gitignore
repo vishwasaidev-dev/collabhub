@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+collabhub.sqlite3
+collabhub.sqlite3-wal
+collabhub.sqlite3-shm
+collabhub.log
+collabhub.err.log
+shared_files/
