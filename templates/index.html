@@ -100,6 +100,7 @@
     padding: 2px 0;
   }
   .checklist-item input[type="checkbox"] { margin-top: 2px; flex: none; }
+  .checklist-item input[aria-disabled="true"] { opacity: .5; }
   .checklist-item .item-text { flex: 1; word-break: break-word; }
   .checklist-item .item-text.done { text-decoration: line-through; color: var(--muted); }
   .checklist-item.checklist-error .item-text { color: var(--blocked); }
@@ -107,7 +108,18 @@
     flex: none; background: none; border: none; color: var(--muted); cursor: pointer;
     font-size: 13px; line-height: 1; padding: 0 2px; visibility: hidden;
   }
-  .checklist-item:hover .item-delete { visibility: visible; }
+  /* Reveal on :focus-within too, not just :hover -- visibility:hidden alone
+     makes the button unreachable by keyboard entirely, since a hidden
+     control can still be focused via Tab (visibility, unlike display, does
+     not remove it from the tab order) but was never visibly revealed when
+     that focus landed (OpenClaw's review). */
+  .checklist-item:hover .item-delete, .checklist-item:focus-within .item-delete { visibility: visible; }
+  .checklist-item .item-delete:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .checklist-item .item-delete[aria-disabled="true"] { opacity: .5; cursor: default; }
+  .item-retry {
+    flex: none; font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--blocked);
+    background: none; color: var(--blocked); cursor: pointer;
+  }
   .checklist-add { display: flex; gap: 4px; margin-top: 6px; }
   .checklist-add input {
     flex: 1; font-size: 12px; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--border);
@@ -117,6 +129,9 @@
     font-size: 12px; padding: 3px 8px; border-radius: 6px; border: 1px solid var(--border);
     background: var(--panel); color: var(--text); cursor: pointer;
   }
+  .checklist-add button[aria-disabled="true"] { opacity: .6; cursor: default; }
+  .checklist-add-error { font-size: 11px; color: var(--blocked); margin-top: 4px; }
+  .checklist-limit { font-size: 11px; color: var(--muted); margin-top: 6px; }
   .empty { color: var(--muted); font-size: 12.5px; padding: 8px 2px; }
   .panel {
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px;
@@ -130,16 +145,30 @@
   /* Collapsible sections (board columns + sidebar panels): the toggle is a
      real <button>, not a clickable div -- Enter/Space/click all work for
      free via native button semantics, no manual role/tabindex/keydown
-     handling needed (OpenClaw's review). Collapsing hides everything in the
-     section EXCEPT its own h2 -- header text, "N new" badges, and column
-     counts stay visible and keep updating from live events while collapsed. */
+     handling needed (OpenClaw's review). Each toggle's aria-controls points
+     at a real, dedicated content element (not an ancestor that also
+     contains the button itself); collapsing sets the `hidden` attribute
+     directly on THAT element, so the accessibility relationship is accurate
+     and the browser's own default [hidden]{display:none} does the hiding --
+     header text, "N new" badges, and column counts live in the h2, outside
+     the hidden element, and stay visible + keep updating from live events
+     while collapsed. */
   .collapse-toggle {
     margin-left: auto; background: none; border: none; color: var(--muted); cursor: pointer;
     font-size: 12px; padding: 2px 5px; line-height: 1; border-radius: 4px; flex: none;
   }
   .collapse-toggle:hover { background: color-mix(in srgb, var(--text) 10%, transparent); color: var(--text); }
   .collapse-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .panel.collapsed > *:not(h2), .col.collapsed > *:not(h2) { display: none; }
+  /* The browser's own [hidden]{display:none} is a USER-AGENT default, which
+     author styles always beat regardless of selector specificity -- so an
+     element that also carries its own explicit `display` rule (e.g.
+     .chat-log's `display:flex`) silently ignores the hidden attribute
+     entirely. Caught live via Playwright (#chatLog stayed visually visible
+     while `hidden` and aria-expanded=false both correctly said otherwise) --
+     this !important makes `hidden` win unconditionally for every current and
+     future collapsible content target, not just the one that happened to
+     collide today. */
+  [hidden] { display: none !important; }
   .newcount {
     background: var(--accent); color: #fff; border-radius: 999px;
     padding: 0 7px; font-size: 10.5px; font-weight: 700;
@@ -292,31 +321,33 @@
     <div class="panel" id="presencePanel">
       <h2>Presence
         <button type="button" class="collapse-toggle" data-section-id="panel:presence" data-section-label="Presence"
-                aria-controls="presencePanel" aria-expanded="true" aria-label="Collapse Presence">&#9662;</button>
+                aria-controls="presence" aria-expanded="true" aria-label="Collapse Presence">&#9662;</button>
       </h2>
       <div id="presence"></div>
     </div>
     <div class="panel" id="notesPanel">
       <h2 class="clickable" id="notesHeader">Shared notes <span class="newcount" id="notesNew" style="display:none;"></span>
         <button type="button" class="collapse-toggle" data-section-id="panel:notes" data-section-label="Shared notes"
-                aria-controls="notesPanel" aria-expanded="true" aria-label="Collapse Shared notes">&#9662;</button>
+                aria-controls="notes" aria-expanded="true" aria-label="Collapse Shared notes">&#9662;</button>
       </h2>
       <div id="notes"></div>
     </div>
     <div class="panel chat-panel" id="chatPanel" style="display:none;">
       <h2 class="clickable" id="chatHeader">Live chat <span class="chat-status" id="chatStatus"></span> <span class="newcount" id="chatNew" style="display:none;"></span>
         <button type="button" class="collapse-toggle" data-section-id="panel:chat" data-section-label="Live chat"
-                aria-controls="chatPanel" aria-expanded="true" aria-label="Collapse Live chat">&#9662;</button>
+                aria-controls="chatLog" aria-expanded="true" aria-label="Collapse Live chat">&#9662;</button>
       </h2>
       <div class="chat-log" id="chatLog"></div>
     </div>
     <div class="panel" id="historyPanel">
       <h2>Chat history
         <button type="button" class="collapse-toggle" data-section-id="panel:history" data-section-label="Chat history"
-                aria-controls="historyPanel" aria-expanded="true" aria-label="Collapse Chat history">&#9662;</button>
+                aria-controls="historyBody" aria-expanded="true" aria-label="Collapse Chat history">&#9662;</button>
       </h2>
-      <div id="historyList"></div>
-      <button class="loadmore" id="historyLoadMore" style="display:none;">Load more</button>
+      <div id="historyBody">
+        <div id="historyList"></div>
+        <button class="loadmore" id="historyLoadMore" style="display:none;">Load more</button>
+      </div>
     </div>
   </div>
 </main>
@@ -371,6 +402,19 @@ let newCounts = { tasks: 0, notes: 0, chat: 0 };
 // rendered disabled so a mid-flight renderBoard() (triggered by an unrelated
 // event) can't offer a second click on the same request.
 let pendingChecklistOps = new Set();
+// "taskId:itemId" -> {action:"toggle"|"delete", desiredDone?:bool} for an
+// item whose last toggle/delete attempt failed -- renders an inline Retry
+// affordance instead of failing silently (OpenClaw's review).
+let checklistItemErrors = new Map();
+// taskId -> {text, message} for a failed add -- keeps the user's typed text
+// visible (never silently lost) and shows why it failed, instead of an
+// alert() (OpenClaw's review).
+let checklistAddErrors = new Map();
+// taskId -> text currently being submitted -- guards against a double-submit
+// while the first request hasn't resolved yet, and keeps the submitted text
+// visibly in the (disabled) input during the request instead of blanking it
+// prematurely.
+let checklistAddPending = new Map();
 
 // --- collapsible sections (board columns + sidebar panels) ----------------
 // Persisted as a JSON array of section ids under one localStorage key,
@@ -411,17 +455,21 @@ function saveCollapsedSections() {
 }
 let collapsedSections = loadCollapsedSections();
 
-// Reflects `collapsedSections` onto the DOM for one section id: toggles the
-// "collapsed" class on its container (.panel or .col -- CSS hides everything
-// in it except the h2) and keeps aria-expanded/label/glyph in sync on every
-// element carrying that data-section-id. Works uniformly for the four static
-// sidebar panels AND the dynamically-regenerated board columns, since it's a
-// live DOM query, not something baked into a render template.
+// Reflects `collapsedSections` onto the DOM for one section id. Each
+// toggle's aria-controls names a real, dedicated content element (never an
+// ancestor that also contains the button itself); collapsing sets the
+// `hidden` attribute directly on THAT element, which is both the correct
+// accessibility relationship and gets the browser's own default
+// [hidden]{display:none} for free -- no separate CSS rule to keep in sync.
+// Works uniformly for the four static sidebar panels AND the
+// dynamically-regenerated board columns, since it's a live DOM query, not
+// something baked into a render template.
 function applySectionCollapse(sectionId) {
   const collapsed = collapsedSections.has(sectionId);
   document.querySelectorAll(`.collapse-toggle[data-section-id="${sectionId}"]`).forEach(btn => {
-    const container = btn.closest(".panel, .col");
-    if (container) container.classList.toggle("collapsed", collapsed);
+    const bodyId = btn.getAttribute("aria-controls");
+    const body = bodyId ? document.getElementById(bodyId) : null;
+    if (body) body.hidden = collapsed;
     btn.setAttribute("aria-expanded", String(!collapsed));
     btn.setAttribute("aria-label", `${collapsed ? "Expand" : "Collapse"} ${btn.dataset.sectionLabel || ""}`.trim());
     btn.innerHTML = collapsed ? "&#9656;" : "&#9662;";
@@ -447,13 +495,17 @@ function ensureSectionExpanded(sectionId) {
   applySectionCollapse(sectionId);
 }
 // One delegated listener handles every collapse toggle, static or
-// regenerated -- stopPropagation matters here: notesHeader/chatHeader also
-// have their own click listener that clears the "N new" badge, and merely
-// collapsing/expanding must NOT clear it (OpenClaw's review).
+// regenerated. NOTE: this alone does NOT stop the click from also reaching
+// notesHeader/chatHeader's own listener -- that listener is bound directly
+// to the h2 and fires during the bubble phase BEFORE the event reaches this
+// document-level handler, so calling stopPropagation() here is too late
+// (OpenClaw caught this: the badge was clearing anyway despite this
+// listener's own stopPropagation call). The actual fix is in
+// notesHeader/chatHeader's listeners below, which ignore clicks whose
+// target is inside .collapse-toggle.
 document.addEventListener("click", (e) => {
   const btn = e.target.closest(".collapse-toggle");
   if (!btn) return;
-  e.stopPropagation();
   toggleSection(btn.dataset.sectionId);
 });
 // Cross-tab sync: the "storage" event fires in OTHER tabs/windows when this
@@ -502,28 +554,54 @@ function isOverdue(ymd) {
 
 // --- rendering (always derived from the Maps above) -------------------------
 
+// Mirrors storage.py's CHECKLIST_MAX_ITEMS_PER_TASK -- surfaced here purely
+// to show the limit in the UI once reached; the server remains the actual
+// enforcement point (this is a display convenience, not a security boundary).
+const CHECKLIST_MAX_ITEMS = 50;
+
 function checklistHtml(t) {
   const items = t.checklist_items || [];
   const progress = t.checklist_progress || { done: 0, total: 0 };
   const itemsHtml = items.map(it => {
-    const busy = pendingChecklistOps.has(`${t.id}:${it.id}`);
+    const key = `${t.id}:${it.id}`;
+    const busy = pendingChecklistOps.has(key);
+    const err = checklistItemErrors.get(key);
+    // aria-disabled, not the `disabled` attribute -- a genuinely disabled
+    // control cannot receive focus at all, which is exactly what broke this
+    // tranche's claimed focus preservation (renderBoard() tried to re-focus
+    // the replacement control while it was still marked busy, and the
+    // browser silently refused). aria-disabled keeps it focusable while the
+    // delegated handlers below guard against a duplicate activation
+    // (OpenClaw's review).
     return `
-      <div class="checklist-item" data-item-id="${it.id}">
-        <input type="checkbox" ${it.done ? "checked" : ""} ${busy ? "disabled" : ""}
+      <div class="checklist-item${err ? " checklist-error" : ""}" data-item-id="${it.id}">
+        <input type="checkbox" ${it.done ? "checked" : ""} ${busy ? 'aria-disabled="true"' : ""}
                data-task-id="${t.id}" data-item-id="${it.id}" aria-label="${esc(it.text)}">
         <span class="item-text ${it.done ? "done" : ""}">${esc(it.text)}</span>
+        ${err ? `<button type="button" class="item-retry" data-task-id="${t.id}" data-item-id="${it.id}"
+                         data-action="${err.action}" data-desired-done="${err.desiredDone ? "1" : "0"}">Retry</button>` : ""}
         <button type="button" class="item-delete" data-task-id="${t.id}" data-item-id="${it.id}"
-                ${busy ? "disabled" : ""} aria-label="Delete checklist item: ${esc(it.text)}">&times;</button>
+                ${busy ? 'aria-disabled="true"' : ""} aria-label="Delete checklist item: ${esc(it.text)}">&times;</button>
       </div>`;
   }).join("");
+  const addErr = checklistAddErrors.get(t.id);
+  const pendingText = checklistAddPending.get(t.id);
+  const addBusy = pendingText !== undefined;
+  const inputValue = addBusy ? pendingText : (addErr ? addErr.text : "");
+  const atLimit = items.length >= CHECKLIST_MAX_ITEMS;
   return `
     <div class="checklist">
       ${progress.total ? `<div class="checklist-progress">${progress.done}/${progress.total} checked off</div>` : ""}
       ${items.length ? `<div class="checklist-items">${itemsHtml}</div>` : ""}
-      <form class="checklist-add" data-task-id="${t.id}">
-        <input type="text" maxlength="300" placeholder="Add checklist item…" aria-label="New checklist item for task #${t.id}">
-        <button type="submit">Add</button>
-      </form>
+      ${atLimit
+        ? `<div class="checklist-limit">Checklist limit reached (${CHECKLIST_MAX_ITEMS}/${CHECKLIST_MAX_ITEMS})</div>`
+        : `<form class="checklist-add" data-task-id="${t.id}">
+             <input type="text" maxlength="300" placeholder="Add checklist item…"
+                    aria-label="New checklist item for task #${t.id}" value="${esc(inputValue)}"
+                    ${addBusy ? 'aria-disabled="true"' : ""}>
+             <button type="submit" ${addBusy ? 'aria-disabled="true"' : ""}>Add</button>
+           </form>
+           ${addErr ? `<div class="checklist-add-error">${esc(addErr.message)}</div>` : ""}`}
     </div>`;
 }
 
@@ -572,9 +650,11 @@ function renderBoard() {
     <div class="col" id="col-${key}">
       <h2>${label} <span class="count">${groups[key].length}</span>
         <button type="button" class="collapse-toggle" data-section-id="column:${key}" data-section-label="${esc(label)} column"
-                aria-controls="col-${key}" aria-expanded="true" aria-label="Collapse ${esc(label)} column">&#9662;</button>
+                aria-controls="col-body-${key}" aria-expanded="true" aria-label="Collapse ${esc(label)} column">&#9662;</button>
       </h2>
-      ${groups[key].length ? groups[key].map(taskCard).join("") : `<div class="empty">nothing here</div>`}
+      <div class="col-body" id="col-body-${key}">
+        ${groups[key].length ? groups[key].map(taskCard).join("") : `<div class="empty">nothing here</div>`}
+      </div>
     </div>
   `).join("");
   renderNewCount("tasks");
@@ -585,10 +665,21 @@ function renderBoard() {
   applyAllCollapseState();
 
   if (restore) {
-    const sel = restore.type === "checklist"
-      ? `${restore.tag}[data-task-id="${restore.taskId}"][data-item-id="${restore.itemId}"]`
-      : `.collapse-toggle[data-section-id="${restore.sectionId}"]`;
-    const el = board.querySelector(sel);
+    let el = null;
+    if (restore.type === "checklist") {
+      el = board.querySelector(`${restore.tag}[data-task-id="${restore.taskId}"][data-item-id="${restore.itemId}"]`);
+    } else if (restore.type === "collapse-toggle") {
+      el = board.querySelector(`.collapse-toggle[data-section-id="${restore.sectionId}"]`);
+      if (!el) {
+        // The exact column can vanish out from under a focused toggle -- the
+        // "Done" column, in particular, only exists while at least one task
+        // is done, so completing the last visible done task removes it.
+        // Fall back to another surviving column toggle, or the board header
+        // itself, rather than silently dropping focus to <body>
+        // (OpenClaw's review).
+        el = board.querySelector('.collapse-toggle[data-section-id^="column:"]') || document.getElementById("boardHeader");
+      }
+    }
     if (el) el.focus();
   }
 }
@@ -601,6 +692,7 @@ function renderBoard() {
 async function toggleChecklistItem(taskId, itemId, done) {
   const key = `${taskId}:${itemId}`;
   pendingChecklistOps.add(key);
+  checklistItemErrors.delete(key);
   renderBoard();
   try {
     const res = await fetch(`/api/tasks/${taskId}/checklist/${itemId}`, {
@@ -614,7 +706,9 @@ async function toggleChecklistItem(taskId, itemId, done) {
   } catch {
     // Leave tasksById untouched -- since we never mutated it optimistically,
     // the re-render below reverts the checkbox to the last known-good
-    // server state on its own; never a blind manual invert.
+    // server state on its own; never a blind manual invert. Surface it
+    // visibly instead of failing silently (OpenClaw's review).
+    checklistItemErrors.set(key, { action: "toggle", desiredDone: done });
   } finally {
     pendingChecklistOps.delete(key);
     renderBoard();
@@ -624,6 +718,7 @@ async function toggleChecklistItem(taskId, itemId, done) {
 async function deleteChecklistItem(taskId, itemId) {
   const key = `${taskId}:${itemId}`;
   pendingChecklistOps.add(key);
+  checklistItemErrors.delete(key);
   renderBoard();
   try {
     const res = await fetch(`/api/tasks/${taskId}/checklist/${itemId}`, { method: "DELETE" });
@@ -631,16 +726,19 @@ async function deleteChecklistItem(taskId, itemId) {
     const task = await fetchTask(taskId);
     if (task) tasksById.set(task.id, task);
   } catch {
-    // ditto -- leave tasksById alone, the item reappears on re-render.
+    // ditto -- leave tasksById alone, the item reappears on re-render, and
+    // flag it with a visible Retry rather than silently doing nothing.
+    checklistItemErrors.set(key, { action: "delete" });
   } finally {
     pendingChecklistOps.delete(key);
     renderBoard();
   }
 }
 
-async function addChecklistItem(taskId, text, formEl) {
-  const btn = formEl.querySelector("button");
-  btn.disabled = true;
+async function addChecklistItem(taskId, text) {
+  checklistAddPending.set(taskId, text);
+  checklistAddErrors.delete(taskId);
+  renderBoard(); // reflects the busy add-button state below immediately
   try {
     const res = await fetch(`/api/tasks/${taskId}/checklist`, {
       method: "POST",
@@ -649,35 +747,74 @@ async function addChecklistItem(taskId, text, formEl) {
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      alert(body.error || "Could not add checklist item.");
+      checklistAddErrors.set(taskId, { text, message: body.error || "Could not add checklist item." });
       return;
     }
     const task = await fetchTask(taskId);
-    if (task) { tasksById.set(task.id, task); renderBoard(); }
+    if (task) tasksById.set(task.id, task);
+    // Success -- checklistAddErrors has no entry for this task, so the
+    // re-render below regenerates the form with an empty input.
+  } catch {
+    // A network failure (fetch itself throwing) previously had no catch at
+    // all here, which meant an unhandled promise rejection AND the input
+    // had already been cleared before the request even started -- the
+    // user's typed text was just gone. Now caught, text preserved via
+    // checklistAddErrors, and shown inline instead of alert() (OpenClaw's
+    // review).
+    checklistAddErrors.set(taskId, { text, message: "Network error -- check your connection and try again." });
   } finally {
-    btn.disabled = false;
+    checklistAddPending.delete(taskId);
+    renderBoard();
   }
 }
 
 document.getElementById("board").addEventListener("change", (e) => {
   const cb = e.target.closest('input[type="checkbox"][data-item-id]');
   if (!cb) return;
+  if (cb.getAttribute("aria-disabled") === "true") {
+    // A request for this exact item is already in flight -- revert the
+    // native toggle the click just made (aria-disabled keeps the control
+    // focusable, unlike the `disabled` attribute, but does not itself block
+    // the click/change from firing, so this guard does that instead) and
+    // don't fire a duplicate request.
+    cb.checked = !cb.checked;
+    return;
+  }
   toggleChecklistItem(Number(cb.dataset.taskId), Number(cb.dataset.itemId), cb.checked);
 });
 document.getElementById("board").addEventListener("click", (e) => {
-  const btn = e.target.closest(".item-delete");
-  if (!btn) return;
-  deleteChecklistItem(Number(btn.dataset.taskId), Number(btn.dataset.itemId));
+  const retryBtn = e.target.closest(".item-retry");
+  if (retryBtn) {
+    const taskId = Number(retryBtn.dataset.taskId), itemId = Number(retryBtn.dataset.itemId);
+    if (retryBtn.dataset.action === "delete") deleteChecklistItem(taskId, itemId);
+    else toggleChecklistItem(taskId, itemId, retryBtn.dataset.desiredDone === "1");
+    return;
+  }
+  const delBtn = e.target.closest(".item-delete");
+  if (delBtn) {
+    if (delBtn.getAttribute("aria-disabled") === "true") return; // already in flight
+    // The button is tiny and revealed on hover/focus -- easy to hit by
+    // accident, so confirm before an unrecoverable delete (OpenClaw's
+    // review suggestion).
+    const label = (delBtn.getAttribute("aria-label") || "").replace(/^Delete checklist item: /, "");
+    if (!confirm(`Delete this checklist item?\n\n${label}`)) return;
+    deleteChecklistItem(Number(delBtn.dataset.taskId), Number(delBtn.dataset.itemId));
+  }
 });
 document.getElementById("board").addEventListener("submit", (e) => {
   const form = e.target.closest(".checklist-add");
   if (!form) return;
   e.preventDefault();
+  if (form.querySelector('button[aria-disabled="true"]')) return; // already submitting
   const input = form.querySelector("input");
   const text = input.value.trim();
   if (!text) return;
-  input.value = "";
-  addChecklistItem(Number(form.dataset.taskId), text, form);
+  // Do NOT clear input.value here -- addChecklistItem only regenerates the
+  // form (via renderBoard) once the request settles, reading the preserved
+  // text back out of checklistAddErrors on failure or an empty value on
+  // success. Clearing it eagerly, as before, meant a failed request lost
+  // the user's typed text permanently (OpenClaw's review).
+  addChecklistItem(Number(form.dataset.taskId), text);
 });
 
 function renderNotes() {
@@ -696,11 +833,12 @@ function renderChat() {
   const panel = document.getElementById("chatPanel");
   if (!activeSession) { panel.style.display = "none"; return; }
   panel.style.display = "";
-  // "No active chat" (structural, style.display) and "collapsed by user
-  // preference" (the .collapsed class from applySectionCollapse) are
-  // deliberately independent -- a newly-started session must reappear
-  // honoring whatever collapse state was last chosen for it, never forced
-  // back open just because it structurally exists again (OpenClaw's review).
+  // "No active chat" (structural, style.display on the whole panel) and
+  // "collapsed by user preference" (the hidden attribute on #chatLog alone,
+  // from applySectionCollapse) are deliberately independent -- a
+  // newly-started session must reappear honoring whatever collapse state
+  // was last chosen for it, never forced back open just because it
+  // structurally exists again (OpenClaw's review).
   applySectionCollapse("panel:chat");
 
   const statusEl = document.getElementById("chatStatus");
@@ -1120,8 +1258,19 @@ function scheduleReconnect() {
 
 // --- section "N new" badges: click a header to clear its count ------------
 document.getElementById("boardHeader").addEventListener("click", () => { newCounts.tasks = 0; renderNewCount("tasks"); });
-document.getElementById("notesHeader").addEventListener("click", () => { newCounts.notes = 0; renderNewCount("notes"); });
-document.getElementById("chatHeader").addEventListener("click", () => { newCounts.chat = 0; renderNewCount("chat"); });
+// Ignore clicks that landed on the collapse-toggle button nested inside this
+// same header -- merely collapsing/expanding must not clear the "N new"
+// badge (OpenClaw's review: the document-level toggle listener fires AFTER
+// this one in the bubble order, so it can't prevent this by itself; this
+// check is the actual fix).
+document.getElementById("notesHeader").addEventListener("click", (e) => {
+  if (e.target.closest(".collapse-toggle")) return;
+  newCounts.notes = 0; renderNewCount("notes");
+});
+document.getElementById("chatHeader").addEventListener("click", (e) => {
+  if (e.target.closest(".collapse-toggle")) return;
+  newCounts.chat = 0; renderNewCount("chat");
+});
 
 // ---------------------------------------------------------------------------
 // Chat history (tranche 2): session list + deep-linkable transcript drawer.
