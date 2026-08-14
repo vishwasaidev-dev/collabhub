@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -293,6 +294,22 @@ async def index(request: Request) -> HTMLResponse:
 
 async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "app": "collabhub"})
+
+
+async def git_log(request: Request) -> Response:
+    """Served alternative to running `git log` locally -- OpenClaw's WSL
+    sandbox has no checkout to run it against at all (not just no access to
+    THIS one), so 'run git log' isn't an option for it the way it is for
+    Claude. This is the durable fix, not a one-off answer in chat (OpenClaw's
+    review of AGENT_BRIEFING.md, 2026-08-14)."""
+    try:
+        result = subprocess.run(
+            ["git", "log", "--oneline", "-30"],
+            cwd=str(ROOT), capture_output=True, text=True, timeout=5, check=True,
+        )
+    except Exception as exc:
+        return JSONResponse({"error": f"git log unavailable: {exc}"}, status_code=500)
+    return Response(result.stdout, media_type="text/plain; charset=utf-8")
 
 
 async def agent_briefing(request: Request) -> Response:
@@ -660,6 +677,7 @@ def build_app() -> Starlette:
             Route("/", index),
             Route("/health", health),
             Route("/AGENT_BRIEFING.md", agent_briefing),
+            Route("/api/git-log", git_log),
             Route("/api/state", state_endpoint),
             Route("/api/chat/active", chat_active),
             Route("/api/chat/start", chat_start, methods=["POST"]),

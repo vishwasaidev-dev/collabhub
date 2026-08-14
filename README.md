@@ -7,6 +7,9 @@ machine — not tied to any one project.
 - **Dashboard:** http://127.0.0.1:8765/ (open directly in a browser, no auth)
 - **MCP endpoint:** http://127.0.0.1:8765/mcp
 - **State as JSON:** http://127.0.0.1:8765/api/state
+- **Agent picking this up cold?** Read [`AGENT_BRIEFING.md`](AGENT_BRIEFING.md) first
+  (or `GET http://127.0.0.1:8765/AGENT_BRIEFING.md` if you have no filesystem access
+  to this checkout).
 
 ## What it is
 

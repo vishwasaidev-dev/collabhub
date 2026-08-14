@@ -33,12 +33,15 @@ an MCP client's tool list is stale (see "known gotchas" below).
    starts.
 3. **After code ships, OpenClaw reviews the actual served code/behavior** — not
    just the design. This has caught real bugs every single time it's been done:
-   5 issues on tranche 1, 13 on tranche 2, 10 on tranche 3. **Multiple review
-   rounds finding new issues each time is the normal, expected shape of this
-   process — it is not a sign anything is going wrong.** Do not shortcut it, and
-   do not be surprised when a "final" fix itself has a bug the next review pass
-   catches (this happened more than once — see tranche 1's recovery-barrier saga
-   in the git log for the canonical example).
+   several review rounds on tranche 1 (see task #8's comment thread for the exact
+   sequence — don't trust a specific number here without checking it, this file
+   has already had one wrong), 13 issues across 3 rounds on tranche 2, 10 issues
+   across 2 rounds on tranche 3. **Multiple review rounds finding new issues each
+   time is the normal, expected shape of this process — it is not a sign anything
+   is going wrong.** Do not shortcut it, and do not be surprised when a "final"
+   fix itself has a bug the next review pass catches (this happened more than
+   once — see tranche 1's recovery-barrier saga in the git log for the canonical
+   example).
 4. Every review round happens **in chat session #4** (see below) and gets
    summarized as comments on the relevant tracking task (#8, #17, #20, ...).
 5. When a tranche is approved, the tracking task is marked `done` and this file
@@ -46,11 +49,21 @@ an MCP client's tool list is stale (see "known gotchas" below).
 
 ## How to re-orient fast
 
-If you (OpenClaw) have lost context on where things stand:
+If you (OpenClaw) have lost context on where things stand, **you cannot run
+`git log` locally** — your sandbox has no checkout of this repo at all, not just
+no access to this particular one. Use the OpenClaw-specific alternatives first:
 
-1. **`git log --oneline`** in this repo. Every commit message is deliberately
-   long-form and explains not just *what* changed but *why* and *what review
-   finding it was responding to*. This is the single richest source of truth.
+1. **`GET http://127.0.0.1:8765/api/git-log`** — served commit history (`git log
+   --oneline -30`, run server-side, returned as plain text), specifically so you
+   don't need local git access to get it. This is the richest source of truth on
+   *why* things are the way they are — every commit message is deliberately
+   long-form and explains what review finding it was responding to. If this route
+   is ever unreachable, ask Claude to paste recent `git log` output directly
+   rather than guessing.
+   (`openclaw mcp probe collabhub` may refresh MCP tool visibility, but it isn't
+   reliable in every environment — REST is the dependable fallback, not probe.)
+   If you DO have local checkout access (Claude, or a future OpenClaw setup that
+   changes this), plain `git log --oneline` works too and is equivalent.
 2. **Check chat session #4** — `get_active_chat_session()` should show it's still
    active. `poll_chat_messages(4, since=0)` (or since your last known message id)
    gets the full transcript. This is where design contracts get negotiated and
@@ -95,17 +108,27 @@ If you (OpenClaw) have lost context on where things stand:
   at session start; tools added to the server after that are invisible until the
   client reconnects/refreshes. This is a known, accepted limitation, not a server
   bug — every MCP tool has a REST equivalent specifically so this never blocks
-  either agent. If OpenClaw's MCP client can't see a tool that this file says
-  exists, try `openclaw mcp probe collabhub` or just use the REST route instead
-  of treating it as broken.
-- **Any DB write that touches more than one table (or the search index) must
-  happen in one `with _connect() as conn:` block, reusing the same `conn`.** Two
-  separate connections/transactions for what's logically one operation is exactly
-  the bug class that caused three of the review rounds above (tranche 1's
-  recovery-barrier saga, tranche 2's atomic-invite-link requirement, tranche 3's
-  same-transaction search-index sync). If you're adding a new mutation, grep the
+  either agent. `openclaw mcp probe collabhub` *might* refresh visibility, but
+  it's not reliable in every environment (confirmed: returned no output at least
+  once) — treat **REST as the dependable fallback**, probe as a maybe-it-helps,
+  not the other way around.
+- **Canonical multi-table/index mutations share one SQLite transaction.** Any DB
+  write that touches more than one table (or the search index) must happen in one
+  `with _connect() as conn:` block, reusing the same `conn`. Two separate
+  connections/transactions for what's logically one operation is exactly the bug
+  class behind tranche 2's atomic-invite-link requirement and tranche 3's
+  same-transaction search-index sync. If you're adding a new mutation, grep the
   existing ones (`create_task`, `start_chat_session`, `_index_for_search`'s
   caller sites) for the pattern before writing a new one.
+- **Client-side event cursors only advance after successful projection or a
+  completed full resync — never on "an attempt was made."** This is a *browser
+  JS* ordering bug, not a DB transaction bug (don't conflate it with the gotcha
+  above) — the dashboard's `lastAppliedEventId`/`recoveryRequired` machinery
+  exists because an early version advanced the cursor as soon as it *tried* to
+  apply an event, before confirming that actually succeeded, silently dropping
+  events on failure. This is tranche 1's recovery-barrier saga (4 review rounds
+  on one ~15-line function before it was actually correct) and is worth reading
+  in full in the git log before writing any similar retry/recovery logic.
 - **Snippet/highlight output from search is never raw HTML.** `snippet()` uses
   non-printable sentinel delimiters (`\x01`/`\x02`), not literal tags — the
   client escapes the whole string first, then swaps sentinels for `<mark>`.
