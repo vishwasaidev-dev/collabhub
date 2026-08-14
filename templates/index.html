@@ -136,6 +136,41 @@
   .checklist-add button[aria-disabled="true"] { opacity: .6; cursor: default; }
   .checklist-add-error { font-size: 11px; color: var(--blocked); margin-top: 4px; }
   .checklist-limit { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .attachments { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 6px; }
+  .attachment-list { max-height: 140px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+  .attachment-item {
+    display: flex; align-items: baseline; gap: 6px; font-size: 12px; flex-wrap: wrap;
+    padding: 2px 0;
+  }
+  .attachment-link {
+    color: var(--accent); text-decoration: none; font-weight: 600; word-break: break-all;
+  }
+  .attachment-link:hover, .attachment-link:focus-visible { text-decoration: underline; }
+  .attachment-meta { color: var(--muted); font-size: 11px; }
+  .attachment-item .attachment-delete {
+    flex: none; background: none; border: none; color: var(--muted); cursor: pointer;
+    font-size: 13px; line-height: 1; padding: 0 2px; visibility: hidden; margin-left: auto;
+  }
+  /* Same :focus-within reveal pattern as the checklist's delete button --
+     Tab reaches the (always-visible) download link first, which reveals
+     this button for the next Tab press. */
+  .attachment-item:hover .attachment-delete, .attachment-item:focus-within .attachment-delete { visibility: visible; }
+  .attachment-item .attachment-delete:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .attachment-item .attachment-delete[aria-disabled="true"] { opacity: .5; cursor: default; }
+  .attachment-item.attachment-error .attachment-link { color: var(--blocked); }
+  .attachment-add { display: flex; gap: 4px; margin-top: 6px; align-items: center; flex-wrap: wrap; }
+  .attachment-add input[type="file"] { flex: 1; font-size: 11.5px; min-width: 0; color: var(--text); }
+  .attachment-add input[aria-disabled="true"] { opacity: .5; }
+  .attachment-add button {
+    font-size: 12px; padding: 3px 8px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); cursor: pointer; flex: none;
+  }
+  .attachment-add button[aria-disabled="true"] { opacity: .6; cursor: default; }
+  .attachment-uploading { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .attachment-upload-retry {
+    font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--blocked);
+    background: none; color: var(--blocked); cursor: pointer; margin-left: 4px;
+  }
   .empty { color: var(--muted); font-size: 12.5px; padding: 8px 2px; }
   .panel {
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px;
@@ -653,6 +688,44 @@ function checklistHtml(t) {
     </div>`;
 }
 
+// Mirrors app.py's MAX_ATTACHMENTS_PER_TASK -- display convenience only,
+// same as CHECKLIST_MAX_ITEMS above; the server is the real boundary.
+const ATTACHMENT_MAX_COUNT = 20;
+
+function attachmentsHtml(t) {
+  const attachments = t.attachments || [];
+  const itemsHtml = attachments.map(a => {
+    const key = `${t.id}:${a.id}`;
+    const busy = pendingAttachmentDeletes.has(key);
+    const err = attachmentDeleteErrors.get(key);
+    return `
+      <div class="attachment-item${err ? " attachment-error" : ""}" data-attachment-id="${a.id}">
+        <a class="attachment-link" href="/api/tasks/${t.id}/attachments/${a.id}/download">${esc(a.filename)}</a>
+        <span class="attachment-meta">${fmtBytes(a.size_bytes)} &middot; ${esc(a.uploaded_by || "?")} &middot; ${fmtTime(a.created_at)}</span>
+        ${err ? `<span class="item-error-msg" role="alert">Delete failed.</span>
+                 <button type="button" class="attachment-retry" data-task-id="${t.id}" data-attachment-id="${a.id}">Retry</button>` : ""}
+        <button type="button" class="attachment-delete" data-task-id="${t.id}" data-attachment-id="${a.id}"
+                ${busy ? 'aria-disabled="true"' : ""} aria-label="Delete attachment: ${esc(a.filename)}">&times;</button>
+      </div>`;
+  }).join("");
+  const uploadErr = attachmentUploadErrors.get(t.id);
+  const uploadingName = attachmentUploadPending.get(t.id);
+  const uploadBusy = uploadingName !== undefined;
+  const atLimit = attachments.length >= ATTACHMENT_MAX_COUNT;
+  return `
+    <div class="attachments">
+      ${attachments.length ? `<div class="attachment-list">${itemsHtml}</div>` : ""}
+      ${atLimit
+        ? `<div class="checklist-limit">Attachment limit reached (${ATTACHMENT_MAX_COUNT}/${ATTACHMENT_MAX_COUNT})</div>`
+        : `<form class="attachment-add" data-task-id="${t.id}" enctype="multipart/form-data">
+             <input type="file" aria-label="Add attachment to task #${t.id}" ${uploadBusy ? 'readonly aria-disabled="true"' : ""}>
+             <button type="submit" ${uploadBusy ? 'aria-disabled="true"' : ""}>${uploadBusy ? "Uploading…" : "Attach"}</button>
+           </form>
+           ${uploadBusy ? `<div class="attachment-uploading">Uploading ${esc(uploadingName)}…</div>` : ""}
+           ${uploadErr ? `<div class="checklist-add-error">${esc(uploadErr.message)} <button type="button" class="attachment-upload-retry" data-task-id="${t.id}">Retry</button></div>` : ""}`}
+    </div>`;
+}
+
 function taskCard(t) {
   const overdue = t.due_date && t.status !== "done" && isOverdue(t.due_date);
   return `
@@ -668,6 +741,7 @@ function taskCard(t) {
         <time>${fmtTime(t.updated_at)}</time>
       </div>
       ${checklistHtml(t)}
+      ${attachmentsHtml(t)}
     </div>`;
 }
 
@@ -680,16 +754,21 @@ function renderBoard() {
   const active = document.activeElement;
   let restore = null;
   if (active && board.contains(active)) {
-    const addForm = active.closest(".checklist-add");
+    const checklistAddForm = active.closest(".checklist-add");
+    const attachmentAddForm = active.closest(".attachment-add");
     if (active.dataset.taskId && active.dataset.itemId) {
       restore = { type: "checklist", tag: active.tagName.toLowerCase(), taskId: active.dataset.taskId, itemId: active.dataset.itemId };
-    } else if (addForm) {
+    } else if (active.dataset.taskId && active.dataset.attachmentId) {
+      restore = { type: "attachment", tag: active.tagName.toLowerCase(), taskId: active.dataset.taskId, attachmentId: active.dataset.attachmentId };
+    } else if (checklistAddForm) {
       // The add input/button carry no data-task-id of their own (only the
       // <form> does) -- without this branch, focus on either one was simply
       // never preserved at all, including the specific case OpenClaw asked
       // for: a failed add should return focus to its own input so the
       // retained text + inline error are immediately actionable.
-      restore = { type: "checklist-add", tag: active.tagName.toLowerCase(), taskId: addForm.dataset.taskId };
+      restore = { type: "checklist-add", tag: active.tagName.toLowerCase(), taskId: checklistAddForm.dataset.taskId };
+    } else if (attachmentAddForm) {
+      restore = { type: "attachment-add", tag: active.tagName.toLowerCase(), taskId: attachmentAddForm.dataset.taskId };
     } else if (active.classList.contains("collapse-toggle") && active.dataset.sectionId) {
       restore = { type: "collapse-toggle", sectionId: active.dataset.sectionId };
     }
@@ -724,12 +803,19 @@ function renderBoard() {
     let el = null;
     if (restore.type === "checklist") {
       el = board.querySelector(`${restore.tag}[data-task-id="${restore.taskId}"][data-item-id="${restore.itemId}"]`);
+    } else if (restore.type === "attachment") {
+      el = board.querySelector(`${restore.tag}[data-task-id="${restore.taskId}"][data-attachment-id="${restore.attachmentId}"]`);
+      // A deleted attachment's own controls are simply gone -- same as a
+      // deleted checklist item, nothing meaningful to restore focus to.
     } else if (restore.type === "checklist-add") {
       const form = board.querySelector(`.checklist-add[data-task-id="${restore.taskId}"]`);
       el = form ? form.querySelector(restore.tag) : null;
       // The add form disappears entirely once the item-count cap is hit --
       // nothing meaningful to restore focus to in that case, same as a
       // deleted checklist item.
+    } else if (restore.type === "attachment-add") {
+      const form = board.querySelector(`.attachment-add[data-task-id="${restore.taskId}"]`);
+      el = form ? form.querySelector(restore.tag) : null;
     } else if (restore.type === "collapse-toggle") {
       el = board.querySelector(`.collapse-toggle[data-section-id="${restore.sectionId}"]`);
       if (!el) {
@@ -742,7 +828,32 @@ function renderBoard() {
         el = board.querySelector('.collapse-toggle[data-section-id^="column:"]') || document.getElementById("boardHeader");
       }
     }
-    if (el) el.focus();
+    if (el) {
+      // .item-delete/.attachment-delete are visibility:hidden until their
+      // row is hovered or has :focus-within -- a real user always reaches
+      // one by hovering or Tab-ing through the (always-visible) preceding
+      // control first, which naturally reveals it before focus lands. This
+      // restore path calls .focus() directly, skipping that reveal step --
+      // and a browser refuses to focus a visibility:hidden element at all,
+      // silently leaving focus wherever it was. That's invisible in the
+      // common case (the row was already hovered/focused a moment ago,
+      // e.g. right after clicking delete, so :hover/:focus-within is still
+      // active when the re-render happens), but breaks the instant an
+      // UNRELATED re-render shifts the row to a different screen position
+      // (e.g. a sibling field changing the card's height moves the row out
+      // from under a still-hovering mouse) -- caught by a dedicated
+      // Playwright scenario forcing exactly that unrelated re-render, not
+      // just the same-interaction case every earlier test happened to
+      // cover. Force it visible immediately before focusing; the CSS
+      // :focus-within rule then keeps it visible for as long as focus
+      // actually stays there, and the next full renderBoard() regenerates
+      // the element from the template anyway, discarding this override
+      // (OpenClaw's review pattern applied preemptively here).
+      if (el.classList.contains("item-delete") || el.classList.contains("attachment-delete")) {
+        el.style.visibility = "visible";
+      }
+      el.focus();
+    }
   }
 }
 
@@ -877,6 +988,87 @@ document.getElementById("board").addEventListener("submit", (e) => {
   // success. Clearing it eagerly, as before, meant a failed request lost
   // the user's typed text permanently (OpenClaw's review).
   addChecklistItem(Number(form.dataset.taskId), text);
+});
+
+// --- attachment interactions ---------------------------------------------
+
+async function uploadAttachment(taskId, file) {
+  attachmentUploadPending.set(taskId, file.name);
+  attachmentUploadErrors.delete(taskId);
+  renderBoard();
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    const res = await fetch(`/api/tasks/${taskId}/attachments`, { method: "POST", body: fd });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      attachmentUploadErrors.set(taskId, { file, message: body.error || "Upload failed." });
+      return;
+    }
+    const task = await fetchTask(taskId);
+    if (task) tasksById.set(task.id, task);
+    // Success -- attachmentUploadErrors has no entry for this task, so the
+    // re-render below regenerates the form with an empty file input.
+  } catch {
+    // Network failure -- same treatment as the checklist add form: keep
+    // the actual File object (not just its name) so Retry can resubmit it
+    // without asking the user to re-pick the file from their filesystem.
+    attachmentUploadErrors.set(taskId, { file, message: "Network error -- check your connection and try again." });
+  } finally {
+    attachmentUploadPending.delete(taskId);
+    renderBoard();
+  }
+}
+
+async function deleteAttachment(taskId, attachmentId) {
+  const key = `${taskId}:${attachmentId}`;
+  pendingAttachmentDeletes.add(key);
+  attachmentDeleteErrors.delete(key);
+  renderBoard();
+  try {
+    const res = await fetch(`/api/tasks/${taskId}/attachments/${attachmentId}`, { method: "DELETE" });
+    if (!res.ok) throw new Error(String(res.status));
+    const task = await fetchTask(taskId);
+    if (task) tasksById.set(task.id, task);
+  } catch {
+    attachmentDeleteErrors.set(key, true);
+  } finally {
+    pendingAttachmentDeletes.delete(key);
+    renderBoard();
+  }
+}
+
+document.getElementById("board").addEventListener("submit", (e) => {
+  const form = e.target.closest(".attachment-add");
+  if (!form) return;
+  e.preventDefault();
+  if (form.querySelector('button[aria-disabled="true"]')) return; // already uploading
+  const input = form.querySelector('input[type="file"]');
+  const file = input.files && input.files[0];
+  if (!file) return;
+  uploadAttachment(Number(form.dataset.taskId), file);
+});
+document.getElementById("board").addEventListener("click", (e) => {
+  const uploadRetryBtn = e.target.closest(".attachment-upload-retry");
+  if (uploadRetryBtn) {
+    const taskId = Number(uploadRetryBtn.dataset.taskId);
+    const err = attachmentUploadErrors.get(taskId);
+    if (err) uploadAttachment(taskId, err.file);
+    return;
+  }
+  const attachRetryBtn = e.target.closest(".attachment-retry");
+  if (attachRetryBtn) {
+    deleteAttachment(Number(attachRetryBtn.dataset.taskId), Number(attachRetryBtn.dataset.attachmentId));
+    return;
+  }
+  const delBtn = e.target.closest(".attachment-delete");
+  if (delBtn) {
+    if (delBtn.getAttribute("aria-disabled") === "true") return; // already in flight
+    const item = delBtn.closest(".attachment-item");
+    const filename = item ? item.querySelector(".attachment-link").textContent : "";
+    if (!confirm(`Delete this attachment?\n\n${filename}`)) return;
+    deleteAttachment(Number(delBtn.dataset.taskId), Number(delBtn.dataset.attachmentId));
+  }
 });
 
 function renderNotes() {
@@ -1101,7 +1293,9 @@ async function applyEvent(evt) {
     case "task_commented":
     case "checklist_item_added":
     case "checklist_item_updated":
-    case "checklist_item_removed": {
+    case "checklist_item_removed":
+    case "attachment_added":
+    case "attachment_removed": {
       const task = await fetchTask(evt.payload.task_id);
       if (!task) {
         // Transient fetch failure: open the recovery barrier immediately so
@@ -1310,7 +1504,8 @@ async function connectSSE() {
   for (const t of ["task_created", "task_updated", "task_commented", "note_posted",
                     "chat_message", "chat_session_started", "chat_session_ended",
                     "task_session_linked", "task_session_unlinked",
-                    "checklist_item_added", "checklist_item_updated", "checklist_item_removed"]) {
+                    "checklist_item_added", "checklist_item_updated", "checklist_item_removed",
+                    "attachment_added", "attachment_removed"]) {
     es.addEventListener(t, (msg) => { try { onSSEMessage(msg); } catch { /* malformed frame */ } });
   }
   es.onerror = () => {
