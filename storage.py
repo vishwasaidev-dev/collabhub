@@ -507,10 +507,30 @@ def poll_chat_messages(session_id: int, since: int = 0) -> dict:
 
 
 def full_state() -> dict:
-    return {
-        "tasks": list_tasks(),
-        "notes": list_notes(limit=100),
-        "active_chat_session": get_active_chat_session(),
-        "latest_chat_session": get_latest_chat_session(),
-        "presence": list_presence(),
-    }
+    """Snapshot every panel the dashboard needs, plus the event id that
+    snapshot is consistent as-of (`event_cursor`). A client that connects its
+    SSE/WS stream with `?since=event_cursor` is then guaranteed no gap and no
+    duplicate: every event <= event_cursor is already reflected here, every
+    event > event_cursor arrives on the stream. That guarantee only holds if
+    all these reads share one WAL snapshot -- an explicit transaction on a
+    single connection, not five independent auto-committing calls (which is
+    what this used to be; OpenClaw's catch, 2026-08-14, before it shipped)."""
+    with _connect() as conn:
+        conn.execute("BEGIN")
+        tasks = [_task_row_to_dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY updated_at DESC").fetchall()]
+        notes = [dict(r) for r in conn.execute("SELECT * FROM notes ORDER BY created_at DESC LIMIT 100").fetchall()]
+        active_chat = conn.execute(
+            "SELECT * FROM chat_sessions WHERE status='active' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        latest_chat = conn.execute("SELECT * FROM chat_sessions ORDER BY id DESC LIMIT 1").fetchone()
+        presence = [dict(r) for r in conn.execute("SELECT * FROM agent_presence ORDER BY last_seen DESC").fetchall()]
+        event_cursor = (conn.execute("SELECT MAX(id) AS m FROM events").fetchone()["m"]) or 0
+        conn.execute("COMMIT")
+        return {
+            "tasks": tasks,
+            "notes": notes,
+            "active_chat_session": dict(active_chat) if active_chat else None,
+            "latest_chat_session": dict(latest_chat) if latest_chat else None,
+            "presence": presence,
+            "event_cursor": event_cursor,
+        }

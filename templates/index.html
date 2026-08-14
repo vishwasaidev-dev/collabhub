@@ -30,11 +30,22 @@
   }
   header h1 { font-size: 18px; margin: 0; }
   header .sub { color: var(--muted); font-size: 13px; }
-  .dot {
-    width: 8px; height: 8px; border-radius: 50%; background: var(--done);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--done) 25%, transparent);
-    margin-left: auto;
+  .conn-status {
+    margin-left: auto; display: flex; align-items: center; gap: 6px;
+    font-size: 11.5px; font-weight: 600; color: var(--muted);
   }
+  .conn-status .dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--muted);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--muted) 25%, transparent);
+  }
+  .conn-status.live { color: var(--done); }
+  .conn-status.live .dot { background: var(--done); box-shadow: 0 0 0 3px color-mix(in srgb, var(--done) 25%, transparent); }
+  .conn-status.reconnecting { color: var(--claimed); }
+  .conn-status.reconnecting .dot { background: var(--claimed); box-shadow: 0 0 0 3px color-mix(in srgb, var(--claimed) 25%, transparent); }
+  .conn-status.polling { color: var(--in_progress); }
+  .conn-status.polling .dot { background: var(--in_progress); box-shadow: 0 0 0 3px color-mix(in srgb, var(--in_progress) 25%, transparent); }
+  .conn-status.offline { color: var(--blocked); }
+  .conn-status.offline .dot { background: var(--blocked); box-shadow: 0 0 0 3px color-mix(in srgb, var(--blocked) 25%, transparent); }
   main {
     display: grid; grid-template-columns: 1fr 340px; gap: 20px;
     padding: 20px 24px; align-items: start;
@@ -70,15 +81,19 @@
     background: color-mix(in srgb, var(--accent) 18%, transparent);
     color: var(--accent); padding: 1px 8px; border-radius: 999px; font-weight: 600;
   }
-  .comments { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 6px; }
-  .comment { font-size: 12px; margin-bottom: 4px; }
-  .comment b { color: var(--accent); }
   .empty { color: var(--muted); font-size: 12.5px; padding: 8px 2px; }
-  .notes-panel {
+  .panel {
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px;
   }
-  .notes-panel h2 {
+  .panel + .panel { margin-top: 20px; }
+  .panel h2 {
     font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 10px;
+    display: flex; align-items: center; gap: 6px; cursor: default;
+  }
+  .panel h2.clickable { cursor: pointer; }
+  .newcount {
+    background: var(--accent); color: #fff; border-radius: 999px;
+    padding: 0 7px; font-size: 10.5px; font-weight: 700;
   }
   .note { padding: 8px 0; border-bottom: 1px solid var(--border); }
   .note:last-child { border-bottom: none; }
@@ -86,7 +101,13 @@
   .note .head b { color: var(--text); }
   .note .text { font-size: 13px; white-space: pre-wrap; }
   time { font-variant-numeric: tabular-nums; }
-  .chat-panel { margin-top: 20px; }
+  .presence-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; font-size: 12.5px; }
+  .presence-row:not(:last-child) { border-bottom: 1px solid var(--border); }
+  .presence-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .presence-dot.online { background: var(--done); box-shadow: 0 0 0 2px color-mix(in srgb, var(--done) 25%, transparent); }
+  .presence-dot.offline { background: var(--muted); }
+  .presence-row b { flex: none; }
+  .presence-row .last { margin-left: auto; color: var(--muted); font-size: 11.5px; }
   .chat-panel h2 { display: flex; align-items: center; gap: 8px; }
   .chat-status {
     font-size: 10.5px; font-weight: 600; text-transform: none; letter-spacing: 0;
@@ -111,17 +132,24 @@
 <header>
   <h1>CollabHub</h1>
   <span class="sub">shared task board + notes &mdash; Claude &amp; OpenClaw</span>
-  <span class="dot" id="dot"></span>
+  <span class="conn-status" id="connStatus"><span class="dot"></span><span id="connLabel">Connecting&hellip;</span></span>
 </header>
 <main>
-  <div class="board" id="board"></div>
   <div>
-    <div class="notes-panel">
-      <h2>Shared notes</h2>
+    <h2 class="clickable" id="boardHeader" style="font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:0 0 10px 2px;display:flex;align-items:center;gap:6px;">Task board <span class="newcount" id="tasksNew" style="display:none;"></span></h2>
+    <div class="board" id="board"></div>
+  </div>
+  <div>
+    <div class="panel" id="presencePanel">
+      <h2>Presence</h2>
+      <div id="presence"></div>
+    </div>
+    <div class="panel" id="notesPanel">
+      <h2 class="clickable" id="notesHeader">Shared notes <span class="newcount" id="notesNew" style="display:none;"></span></h2>
       <div id="notes"></div>
     </div>
-    <div class="notes-panel chat-panel" id="chatPanel" style="display:none;">
-      <h2>Live chat <span class="chat-status" id="chatStatus"></span></h2>
+    <div class="panel chat-panel" id="chatPanel" style="display:none;">
+      <h2 class="clickable" id="chatHeader">Live chat <span class="chat-status" id="chatStatus"></span> <span class="newcount" id="chatNew" style="display:none;"></span></h2>
       <div class="chat-log" id="chatLog"></div>
     </div>
   </div>
@@ -133,20 +161,49 @@ const COLUMNS = [
   ["in_progress", "In progress"],
   ["blocked", "Blocked"],
 ];
-// "done" tasks are folded into the last column's bottom via a 5th visual
-// group only if present, to keep the board from permanently reserving a
-// 5th column once things start finishing.
+
+// ---------------------------------------------------------------------------
+// Canonical client-side state. Every task/note/chat-message is kept in a Map
+// keyed by its own id, populated from either the initial atomic snapshot
+// (/api/state) or a full re-fetch triggered by a live event. Rendering always
+// derives from these maps, never patches the DOM from an event payload
+// directly -- event payloads are deltas (e.g. task_updated only carries
+// status/assignee), so trusting them for rendering would blank out fields
+// the payload didn't mention (OpenClaw's review, 2026-08-14).
+// ---------------------------------------------------------------------------
+let tasksById = new Map();
+let notesById = new Map();
+let chatMessagesById = new Map();
+let presenceByAgent = new Map();
+let activeSession = null;   // {id, status, started_by, ...} | null
+let lastAppliedEventId = 0; // dedupe/idempotency gate -- ignore event.id <= this
+let pageLoadCursor = 0;     // event_cursor at initial load, for "N new" badges
+let newCounts = { tasks: 0, notes: 0, chat: 0 };
+
 function fmtTime(iso) {
   try {
     const d = new Date(iso);
     return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
   } catch { return iso; }
 }
+function relTime(iso) {
+  const ms = Date.now() - new Date(iso).getTime();
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 10) return "just now";
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return fmtTime(iso);
+}
 function esc(s) {
   return (s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
+
+// --- rendering (always derived from the Maps above) -------------------------
+
 function taskCard(t) {
-  const comments = (t.comments || []);
   return `
     <div class="card">
       <div class="title">#${t.id} ${esc(t.title)}</div>
@@ -159,17 +216,9 @@ function taskCard(t) {
       </div>
     </div>`;
 }
-async function refresh() {
-  let data;
-  try {
-    const res = await fetch("/api/state", { cache: "no-store" });
-    data = await res.json();
-    document.getElementById("dot").style.background = "var(--done)";
-  } catch (e) {
-    document.getElementById("dot").style.background = "var(--blocked)";
-    return;
-  }
-  const tasks = data.tasks || [];
+
+function renderBoard() {
+  const tasks = [...tasksById.values()].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
   const board = document.getElementById("board");
   const groups = { open: [], claimed: [], in_progress: [], blocked: [], done: [] };
   for (const t of tasks) (groups[t.status] || groups.open).push(t);
@@ -183,8 +232,11 @@ async function refresh() {
       ${groups[key].length ? groups[key].map(taskCard).join("") : `<div class="empty">nothing here</div>`}
     </div>
   `).join("");
+  renderNewCount("tasks");
+}
 
-  const notes = data.notes || [];
+function renderNotes() {
+  const notes = [...notesById.values()].sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
   document.getElementById("notes").innerHTML = notes.length
     ? notes.map(n => `
         <div class="note">
@@ -192,28 +244,21 @@ async function refresh() {
           <div class="text">${esc(n.text)}</div>
         </div>`).join("")
     : `<div class="empty">no notes yet</div>`;
-
-  await refreshChat(data.latest_chat_session);
+  renderNewCount("notes");
 }
 
-async function refreshChat(session) {
+function renderChat() {
   const panel = document.getElementById("chatPanel");
-  if (!session) { panel.style.display = "none"; return; }
+  if (!activeSession) { panel.style.display = "none"; return; }
   panel.style.display = "";
 
   const statusEl = document.getElementById("chatStatus");
-  statusEl.textContent = session.status;
-  statusEl.className = "chat-status " + session.status;
-
-  let data;
-  try {
-    const res = await fetch(`/api/chat/poll?session_id=${session.id}&since=0`, { cache: "no-store" });
-    data = await res.json();
-  } catch (e) { return; }
+  statusEl.textContent = activeSession.status;
+  statusEl.className = "chat-status " + activeSession.status;
 
   const log = document.getElementById("chatLog");
   const wasAtBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 30;
-  const msgs = data.messages || [];
+  const msgs = [...chatMessagesById.values()].sort((a, b) => a.id - b.id);
   log.innerHTML = msgs.length
     ? msgs.map(m => `
         <div class="msg ${esc(m.author)}">
@@ -222,10 +267,273 @@ async function refreshChat(session) {
         </div>`).join("")
     : `<div class="empty">session started, no messages yet</div>`;
   if (wasAtBottom) log.scrollTop = log.scrollHeight;
+  renderNewCount("chat");
 }
 
-refresh();
-setInterval(refresh, 2000);
+function renderNewCount(section) {
+  const elId = { tasks: "tasksNew", notes: "notesNew", chat: "chatNew" }[section];
+  const el = document.getElementById(elId);
+  const n = newCounts[section];
+  if (n > 0) { el.style.display = ""; el.textContent = `${n} new`; }
+  else { el.style.display = "none"; }
+}
+
+// Presence: rendered on its own 5s timer (not tied to event/network traffic)
+// so an agent that's gone quiet visibly flips to offline even with zero new
+// events -- last_seen alone can't do that without a timer independent of
+// when data last arrived (OpenClaw's review, point 6).
+function renderPresence() {
+  const rows = [...presenceByAgent.values()].sort((a, b) => (a.last_seen < b.last_seen ? 1 : -1));
+  const el = document.getElementById("presence");
+  el.innerHTML = rows.length
+    ? rows.map(p => {
+        const online = (Date.now() - new Date(p.last_seen).getTime()) < 30000;
+        return `
+          <div class="presence-row">
+            <span class="presence-dot ${online ? "online" : "offline"}"></span>
+            <b>${esc(p.agent)}</b>
+            <span class="last">${online ? "online" : relTime(p.last_seen)}</span>
+          </div>`;
+      }).join("")
+    : `<div class="empty">no activity yet</div>`;
+}
+
+// --- data loading -------------------------------------------------------
+
+async function fetchTask(taskId) {
+  try {
+    const res = await fetch(`/api/tasks/${taskId}`, { cache: "no-store" });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
+}
+
+async function fetchPresence() {
+  try {
+    const res = await fetch("/api/presence", { cache: "no-store" });
+    const rows = await res.json();
+    for (const p of rows) presenceByAgent.set(p.agent, p);
+    renderPresence();
+  } catch { /* independent of SSE health; just skip this tick */ }
+}
+
+// Full atomic resync -- used for the very first load, and again whenever the
+// stream recovers from an outage, so anything missed during a gap gets
+// reconciled rather than silently staying stale (review point 5/8).
+async function fullResync() {
+  const res = await fetch("/api/state", { cache: "no-store" });
+  const data = await res.json();
+
+  tasksById = new Map((data.tasks || []).map(t => [t.id, t]));
+  notesById = new Map((data.notes || []).map(n => [n.id, n]));
+  for (const p of data.presence || []) presenceByAgent.set(p.agent, p);
+  activeSession = data.latest_chat_session || null;
+
+  if (activeSession) {
+    try {
+      const res2 = await fetch(`/api/chat/poll?session_id=${activeSession.id}&since=0`, { cache: "no-store" });
+      const chatData = await res2.json();
+      chatMessagesById = new Map((chatData.messages || []).map(m => [m.id, m]));
+    } catch { /* chat panel just stays with whatever it had */ }
+  } else {
+    chatMessagesById = new Map();
+  }
+
+  renderBoard(); renderNotes(); renderChat(); renderPresence();
+  return data.event_cursor || 0;
+}
+
+// Single-flight guard: the reconnect path and the 3s poll-fallback interval
+// can otherwise both call fullResync() around the same moment (a reconnect
+// attempt landing mid-interval), each independently rebuilding tasksById/etc
+// from a separately-fetched snapshot -- redundant at best, and a source of
+// visible flicker/lost-in-race updates at worst (OpenClaw's review,
+// secondary point). Concurrent callers all await the one resync in flight.
+let resyncPromise = null;
+function fullResyncSingleFlight() {
+  if (!resyncPromise) {
+    resyncPromise = fullResync().finally(() => { resyncPromise = null; });
+  }
+  return resyncPromise;
+}
+
+// --- live event application ---------------------------------------------
+
+// Serializes applyEvent calls into strict arrival order. Without this, two
+// events landing close together (e.g. two addEventListener callbacks firing
+// back to back) each kick off their own async task fetch, and those fetches
+// can resolve out of order -- an earlier event's fetch completing after a
+// later one's would silently stomp the newer state back to the older one
+// (OpenClaw's review, point 3).
+let applyQueue = Promise.resolve();
+function queueApply(evt) {
+  applyQueue = applyQueue.then(() => applyEvent(evt)).catch(() => {});
+}
+
+// Events are applied through a single-flight promise chain (queueApply, near
+// the SSE wiring below), so this never runs concurrently with itself --
+// otherwise two in-flight task fetches could resolve out of order and undo
+// each other's effect on tasksById (OpenClaw's review, point 3).
+async function applyEvent(evt) {
+  if (evt.id <= lastAppliedEventId) return; // replay/duplicate -- already applied
+  const isNew = evt.id > pageLoadCursor;
+
+  switch (evt.type) {
+    case "task_created":
+    case "task_updated":
+    case "task_commented": {
+      const task = await fetchTask(evt.payload.task_id);
+      if (!task) {
+        // Transient fetch failure: do NOT commit this event id -- committing
+        // it here would permanently dedupe an event whose effect was never
+        // actually applied, leaving the card stale until some unrelated
+        // reconnect happened to fix it. Reconcile with a full resync instead
+        // and let this event id be retried (a resync moves lastAppliedEventId
+        // itself, so nothing double-applies) (OpenClaw's review, point 3).
+        fullResyncSingleFlight().catch(() => {});
+        return;
+      }
+      tasksById.set(task.id, task);
+      if (isNew) newCounts.tasks++;
+      renderBoard();
+      break;
+    }
+    case "note_posted": {
+      notesById.set(evt.payload.note_id, {
+        id: evt.payload.note_id, author: evt.payload.author,
+        text: evt.payload.text, created_at: evt.created_at,
+      });
+      if (isNew) newCounts.notes++;
+      renderNotes();
+      break;
+    }
+    case "chat_message": {
+      if (activeSession && activeSession.id === evt.payload.session_id) {
+        chatMessagesById.set(evt.payload.message_id, {
+          id: evt.payload.message_id, session_id: evt.payload.session_id,
+          author: evt.payload.author, text: evt.payload.text, created_at: evt.created_at,
+        });
+        if (isNew) newCounts.chat++;
+        renderChat();
+      }
+      break;
+    }
+    case "chat_session_started": {
+      activeSession = { id: evt.payload.session_id, status: "active", started_by: evt.payload.started_by };
+      chatMessagesById = new Map();
+      renderChat();
+      break;
+    }
+    case "chat_session_ended": {
+      if (activeSession && activeSession.id === evt.payload.session_id) {
+        activeSession = { ...activeSession, status: "ended" };
+        renderChat();
+      }
+      break;
+    }
+  }
+  lastAppliedEventId = evt.id; // only commit the cursor after successful application
+}
+
+// --- connection lifecycle: SSE primary, polling fallback, manual backoff ---
+// Deliberately not relying on EventSource's built-in auto-retry alone: we
+// want a visible Live/Reconnecting/Polling indicator and a hard fallback to
+// polling after repeated failures, with SSE and polling never both driving
+// renders at the same time (review point 5).
+
+let es = null;
+let reconnectAttempts = 0;
+let reconnectTimer = null;
+let pollFallbackTimer = null;
+
+function setConnStatus(state, label) {
+  const el = document.getElementById("connStatus");
+  el.className = "conn-status " + state;
+  document.getElementById("connLabel").textContent = label;
+}
+
+function stopPollFallback() {
+  if (pollFallbackTimer) { clearInterval(pollFallbackTimer); pollFallbackTimer = null; }
+}
+
+function startPollFallback() {
+  if (pollFallbackTimer) return;
+  setConnStatus("polling", "Polling");
+  pollFallbackTimer = setInterval(() => { fullResyncSingleFlight().catch(() => {}); }, 3000);
+}
+
+async function connectSSE() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  // Pause the poll-fallback interval for the duration of this reconnect
+  // attempt -- otherwise it can fire mid-attempt and race the resync below
+  // even with the single-flight guard papering over the worst of it
+  // (OpenClaw's review, secondary point). Resumes via startPollFallback()
+  // below if this attempt also fails.
+  stopPollFallback();
+
+  let cursor;
+  try {
+    cursor = await fullResyncSingleFlight();
+  } catch {
+    setConnStatus("offline", "Offline");
+    if (reconnectAttempts >= 3) startPollFallback();
+    scheduleReconnect();
+    return;
+  }
+  if (pageLoadCursor === 0 && lastAppliedEventId === 0) pageLoadCursor = cursor; // only on very first connect
+  lastAppliedEventId = Math.max(lastAppliedEventId, cursor);
+
+  if (es) { es.close(); }
+  es = new EventSource(`/api/events/stream?since=${cursor}`);
+
+  es.onopen = () => {
+    reconnectAttempts = 0;
+    stopPollFallback();
+    setConnStatus("live", "Live");
+  };
+  // Server frames carry an explicit `event: <type>` field (added for spec
+  // compliance/Last-Event-ID support -- see the SSE endpoint). Per the
+  // EventSource spec, a named event type does NOT fire .onmessage, only
+  // addEventListener(type, ...) -- learned this the hard way via a real
+  // browser test, since curl-based testing can't tell the difference
+  // (2026-08-14). Route every known type through the same handler, plus
+  // .onmessage as a fallback for any frame sent without a type. Applied
+  // events go through queueApply so out-of-order async fetches can't stomp
+  // each other (see queueApply above).
+  const onSSEMessage = (msg) => { queueApply(JSON.parse(msg.data)); };
+  es.onmessage = (msg) => { try { onSSEMessage(msg); } catch { /* malformed frame */ } };
+  for (const t of ["task_created", "task_updated", "task_commented", "note_posted",
+                    "chat_message", "chat_session_started", "chat_session_ended"]) {
+    es.addEventListener(t, (msg) => { try { onSSEMessage(msg); } catch { /* malformed frame */ } });
+  }
+  es.onerror = () => {
+    es.close();
+    reconnectAttempts++;
+    // Polling (if it kicks in) is the more informative state to show than a
+    // generic "Reconnecting" that would otherwise overwrite it every retry
+    // (OpenClaw's review, point 2) -- only announce "Reconnecting" while
+    // still under the fallback threshold.
+    if (reconnectAttempts >= 3) { startPollFallback(); }
+    else { setConnStatus("reconnecting", "Reconnecting…"); }
+    scheduleReconnect();
+  };
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  const delay = Math.min(2000 * Math.pow(2, reconnectAttempts), 15000);
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; connectSSE(); }, delay);
+}
+
+// --- section "N new" badges: click a header to clear its count ------------
+document.getElementById("boardHeader").addEventListener("click", () => { newCounts.tasks = 0; renderNewCount("tasks"); });
+document.getElementById("notesHeader").addEventListener("click", () => { newCounts.notes = 0; renderNewCount("notes"); });
+document.getElementById("chatHeader").addEventListener("click", () => { newCounts.chat = 0; renderNewCount("chat"); });
+
+connectSSE();
+fetchPresence();
+setInterval(fetchPresence, 15000);
+setInterval(renderPresence, 5000);
 </script>
 </body>
 </html>
