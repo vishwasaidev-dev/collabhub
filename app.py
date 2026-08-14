@@ -314,13 +314,18 @@ async def chat_poll(request: Request) -> JSONResponse:
 
 
 async def chat_sessions_list(request: Request) -> JSONResponse:
-    """Tranche-2 history index -- cursor-paginated, active pinned first on
-    page 1. Superseded the old plain LIMIT listing (kept server-side as
-    storage.list_chat_sessions for the legacy MCP tool only)."""
+    """Tranche-2 history index -- cursor-paginated, active session returned
+    separately as pinned_active (not folded into sessions -- OpenClaw's
+    review: limit must stay a hard maximum). Superseded the old plain LIMIT
+    listing (kept server-side as storage.list_chat_sessions for the legacy
+    MCP tool only)."""
     cursor_param = request.query_params.get("cursor")
     cursor = int(cursor_param) if cursor_param is not None else None
     limit = int(request.query_params.get("limit", 20))
-    return JSONResponse(storage.list_chat_sessions_paginated(cursor, limit))
+    try:
+        return JSONResponse(storage.list_chat_sessions_paginated(cursor, limit))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 async def chat_session_detail(request: Request) -> JSONResponse:

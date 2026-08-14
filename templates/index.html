@@ -556,22 +556,27 @@ async function applyEvent(evt) {
         renderChat();
       }
       // Live-tail into an open transcript drawer too, if it's showing this
-      // same session -- a history view of the active session shouldn't need
-      // its own separate poll loop when the event log already has it.
+      // same session -- but only once the historical backlog has fully
+      // loaded (see viewingBacklogComplete above); otherwise park it.
       if (viewingSessionId === evt.payload.session_id) {
-        viewingMessages.set(evt.payload.message_id, {
+        const msg = {
           id: evt.payload.message_id, session_id: evt.payload.session_id,
           author: evt.payload.author, text: evt.payload.text, created_at: evt.created_at,
-        });
+        };
+        if (viewingBacklogComplete) viewingMessages.set(msg.id, msg);
+        else pendingLiveMessages.push(msg);
         renderTranscript();
       }
+      // Keep the history list's message_count fresh without resetting
+      // pagination (OpenClaw's review, point 3).
+      refreshHistoryRow(evt.payload.session_id);
       break;
     }
     case "chat_session_started": {
       activeSession = { id: evt.payload.session_id, status: "active", started_by: evt.payload.started_by, linked_tasks: [] };
       chatMessagesById = new Map();
       renderChat();
-      refreshHistoryList();
+      refreshHistoryList(); // a brand new session isn't a row refreshHistoryRow can patch -- needs the real page-1 fetch
       break;
     }
     case "chat_session_ended": {
@@ -586,6 +591,55 @@ async function applyEvent(evt) {
         fetchSessionMeta(evt.payload.session_id).catch(() => {});
       }
       refreshHistoryList();
+      break;
+    }
+    case "task_session_linked":
+    case "task_session_unlinked": {
+      // CRITICAL fix (OpenClaw's review pass 1): these two event types
+      // existed server-side but were never registered as SSE listeners, so
+      // link/unlink changes never reached the browser at all until an
+      // unrelated resync happened to sweep them in.
+      //
+      // Pass 2 caught that the FIX still committed the cursor even when the
+      // refresh calls failed silently (they were fire-and-forget with
+      // internal catches) -- the same "commit before success confirmed" bug
+      // class as the task-fetch path, just recurring here. Now awaited, and
+      // any failure opens the same recoveryRequired barrier the task path
+      // uses, rather than permanently acknowledging a relation change that
+      // was never actually reflected in the UI.
+      const taskId = evt.payload.task_id, sessionId = evt.payload.session_id;
+      let ok = true;
+      if (tasksById.has(taskId)) {
+        const task = await fetchTask(taskId);
+        if (task) { tasksById.set(task.id, task); renderBoard(); }
+        else ok = false;
+      }
+      try {
+        const res = await fetch(`/api/chat/sessions/${sessionId}`, { cache: "no-store" });
+        if (!res.ok) throw new Error("fetch failed: " + res.status);
+        const data = await res.json();
+        if (historyPinnedActive && historyPinnedActive.id === sessionId) { historyPinnedActive = data; renderHistoryList(); }
+        else {
+          const idx = historySessions.findIndex(s => s.id === sessionId);
+          if (idx !== -1) { historySessions[idx] = data; renderHistoryList(); }
+        }
+        if (viewingSessionId === sessionId) { viewingSessionMeta = data; renderTranscript(); }
+      } catch {
+        ok = false;
+      }
+      if (!ok) {
+        recoveryRequired = true;
+        try {
+          const cursor = await fullResyncSingleFlight();
+          lastAppliedEventId = Math.max(lastAppliedEventId, cursor);
+          recoveryRequired = false;
+          await refreshHistoryList(); // fullResync covers board/notes/chat/presence but not the history panel
+        } catch {
+          if (es) { es.close(); }
+          connectSSE();
+        }
+        return; // skip the unconditional cursor commit below -- same discipline as the task-event recovery path
+      }
       break;
     }
   }
@@ -661,7 +715,8 @@ async function connectSSE() {
   const onSSEMessage = (msg) => { queueApply(JSON.parse(msg.data)); };
   es.onmessage = (msg) => { try { onSSEMessage(msg); } catch { /* malformed frame */ } };
   for (const t of ["task_created", "task_updated", "task_commented", "note_posted",
-                    "chat_message", "chat_session_started", "chat_session_ended"]) {
+                    "chat_message", "chat_session_started", "chat_session_ended",
+                    "task_session_linked", "task_session_unlinked"]) {
     es.addEventListener(t, (msg) => { try { onSSEMessage(msg); } catch { /* malformed frame */ } });
   }
   es.onerror = () => {
@@ -694,7 +749,14 @@ document.getElementById("chatHeader").addEventListener("click", () => { newCount
 // (not counted against it) -- a deliberate reading of "pinned first" as
 // "always visible", flagged explicitly for review rather than assumed.
 // ---------------------------------------------------------------------------
-let historySessions = [];
+// SESSION_ID_RE guards every place a session id is parsed from user-facing
+// input (URL query param) rather than trusted server data -- "4junk" must
+// not silently open session 4, and NaN must never reach a /NaN request
+// (OpenClaw's review, point 5).
+const SESSION_ID_RE = /^[1-9]\d*$/;
+
+let historyPinnedActive = null; // the active session, kept separate from `sessions`
+let historySessions = [];       // strictly <= the page limit -- limit is a hard max (OpenClaw's review, "pinned active" decision)
 let historyCursor = null;
 let historyHasMore = false;
 
@@ -703,6 +765,13 @@ let viewingSessionMeta = null;
 let viewingMessages = new Map();
 let viewingNextAfterId = 0;
 let viewingHasMore = false;
+// While the historical backlog is still loading, live messages are parked
+// here instead of spliced into viewingMessages -- otherwise the transcript
+// would show [oldest loaded page] + [newest live message] with a hidden gap
+// of un-fetched ids in between, looking contiguous when it isn't (OpenClaw's
+// review, point 4).
+let viewingBacklogComplete = false;
+let pendingLiveMessages = [];
 
 function fmtDuration(seconds) {
   if (seconds == null) return "ongoing";
@@ -727,6 +796,7 @@ async function fetchHistoryPage(cursor) {
 async function refreshHistoryList() {
   const data = await fetchHistoryPage(null).catch(() => null);
   if (!data) return;
+  historyPinnedActive = data.pinned_active;
   historySessions = data.sessions;
   historyCursor = data.next_cursor;
   historyHasMore = data.has_more;
@@ -744,18 +814,53 @@ async function loadMoreHistory() {
   renderHistoryList();
 }
 
+// Patches ONE row (in-place) without resetting pagination -- used for
+// high-frequency updates (a new chat message ticking up message_count, a
+// link/unlink changing chips) where refetching page 1 would be wasteful and
+// would discard whatever pages the user has already loaded further down
+// (OpenClaw's review, point 3).
+async function refreshHistoryRow(sessionId) {
+  try {
+    const res = await fetch(`/api/chat/sessions/${sessionId}`, { cache: "no-store" });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (historyPinnedActive && historyPinnedActive.id === sessionId) {
+      historyPinnedActive = data;
+      renderHistoryList();
+      return;
+    }
+    const idx = historySessions.findIndex(s => s.id === sessionId);
+    if (idx !== -1) {
+      historySessions[idx] = data;
+      renderHistoryList();
+    }
+    // Not found in either: session isn't loaded client-side yet (e.g. a page
+    // further down than what's been fetched) -- nothing to patch, and it'll
+    // show correctly whenever that page is actually loaded.
+  } catch { /* best effort -- a stale row self-heals on the next full refresh */ }
+}
+
 function renderHistoryList() {
   const el = document.getElementById("historyList");
-  el.innerHTML = historySessions.length
-    ? historySessions.map(s => `
-        <div class="history-row" data-session-id="${s.id}">
+  const rows = (historyPinnedActive ? [historyPinnedActive] : []).concat(historySessions);
+  // role="button" + tabindex + Enter/Space handling -- these were plain
+  // unfocusable <div>s with only a click listener, so keyboard users
+  // couldn't open a transcript at all (review pass 2, point 4).
+  el.innerHTML = rows.length
+    ? rows.map(s => `
+        <div class="history-row" data-session-id="${s.id}" role="button" tabindex="0"
+             aria-label="Open session ${s.id}, ${esc(s.status)}">
           <span class="hid">#${s.id}</span>
           <span class="htitle">${esc(s.status)} &middot; started by ${esc(s.started_by || "?")} ${linkChips(s.linked_tasks)}</span>
           <span class="hmeta">${s.message_count} msg &middot; ${fmtDuration(s.duration_seconds)}</span>
         </div>`).join("")
     : `<div class="empty">no sessions yet</div>`;
   for (const row of el.querySelectorAll(".history-row")) {
-    row.addEventListener("click", () => openTranscript(parseInt(row.dataset.sessionId, 10)));
+    const open = () => openTranscript(parseInt(row.dataset.sessionId, 10), true, row);
+    row.addEventListener("click", open);
+    row.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
+    });
   }
   document.getElementById("historyLoadMore").style.display = historyHasMore ? "" : "none";
 }
@@ -771,35 +876,89 @@ async function fetchSessionMeta(sessionId) {
   return data;
 }
 
-async function openTranscript(sessionId, push = true) {
+function resetDrawerControls() {
+  // Hidden until we know the session actually exists -- otherwise these
+  // could retain a stale href/visible state left over from whatever was
+  // open previously (OpenClaw's review, point 5).
+  document.getElementById("transcriptLoadMore").style.display = "none";
+  document.getElementById("transcriptExportJson").style.display = "none";
+  document.getElementById("transcriptExportMd").style.display = "none";
+}
+
+// drawerOpen tracks whether the drawer is visible at all -- separate from
+// viewingSessionId, which is null both when the drawer is closed AND when
+// it's showing the "invalid session id" error state. Using viewingSessionId
+// alone for the Escape-key guard meant Escape couldn't close an invalid-id
+// drawer (OpenClaw's review pass 2, point 2).
+let drawerOpen = false;
+// Element to return keyboard focus to on close (the history row that was
+// activated, typically) -- null for a fresh deep link, where there's
+// nothing meaningful to restore focus to (OpenClaw's review pass 2, point 4).
+let drawerOpenerEl = null;
+
+function showInvalidSessionId(raw, originEl = null) {
+  viewingSessionId = null;
+  drawerOpen = true;
+  drawerOpenerEl = originEl;
+  document.getElementById("drawerBackdrop").style.display = "";
+  document.getElementById("transcriptDrawer").style.display = "flex";
+  document.getElementById("transcriptTitle").textContent = "Invalid session";
+  document.getElementById("transcriptMeta").textContent = "";
+  document.getElementById("transcriptBody").innerHTML =
+    `<div class="drawer-error">"${esc(raw)}" is not a valid session id.</div>`;
+  resetDrawerControls();
+  document.getElementById("transcriptClose").focus();
+}
+
+async function openTranscript(sessionId, push = true, originEl = null) {
   viewingSessionId = sessionId;
   viewingSessionMeta = null;
   viewingMessages = new Map();
   viewingNextAfterId = 0;
   viewingHasMore = false;
+  viewingBacklogComplete = false;
+  pendingLiveMessages = [];
+  drawerOpen = true;
+  drawerOpenerEl = originEl;
 
   document.getElementById("drawerBackdrop").style.display = "";
   document.getElementById("transcriptDrawer").style.display = "flex";
   document.getElementById("transcriptTitle").textContent = `Session #${sessionId}`;
   document.getElementById("transcriptMeta").textContent = "";
   document.getElementById("transcriptBody").innerHTML = `<div class="empty">Loading&hellip;</div>`;
-  document.getElementById("transcriptExportJson").href = `/api/chat/sessions/${sessionId}/export?format=json`;
-  document.getElementById("transcriptExportMd").href = `/api/chat/sessions/${sessionId}/export?format=markdown`;
+  resetDrawerControls();
+  document.getElementById("transcriptClose").focus();
 
-  if (push) history.pushState({ session: sessionId }, "", "?session=" + sessionId);
+  // Opening pushes a NEW history entry marked `pushed: true`; closing goes
+  // back to whatever preceded it (see closeTranscript) rather than pushing a
+  // further "closed" entry forward -- otherwise Back from the closed state
+  // revisits the stale ?session=N entry and reopens it (review pass 1,
+  // point 2). The `pushed` marker itself is what lets closeTranscript tell a
+  // state WE pushed apart from the page's own base/initial entry (review
+  // pass 2, point 1) -- back() is only safe on the former; a direct deep
+  // link's initial entry has nothing "before" it in this tab worth leaving
+  // the app for.
+  if (push) history.pushState({ session: sessionId, pushed: true }, "", "?session=" + sessionId);
 
   try {
     await fetchSessionMeta(sessionId);
   } catch {
     // Recoverable error state, not a crash -- covers both an unknown session
-    // id typed/linked directly and a transient fetch failure (OpenClaw's
-    // review, point 9).
+    // id typed/linked directly and a transient fetch failure.
     if (viewingSessionId === sessionId) {
       document.getElementById("transcriptBody").innerHTML =
         `<div class="drawer-error">Session #${sessionId} not found or couldn't be loaded.</div>`;
     }
     return;
   }
+  if (viewingSessionId !== sessionId) return; // moved on while the meta fetch was in flight
+
+  // Only reveal export links once we've confirmed the session exists.
+  document.getElementById("transcriptExportJson").href = `/api/chat/sessions/${sessionId}/export?format=json`;
+  document.getElementById("transcriptExportJson").style.display = "";
+  document.getElementById("transcriptExportMd").href = `/api/chat/sessions/${sessionId}/export?format=markdown`;
+  document.getElementById("transcriptExportMd").style.display = "";
+
   await loadMoreTranscript();
 }
 
@@ -824,7 +983,18 @@ async function loadMoreTranscript() {
   for (const m of data.messages) viewingMessages.set(m.id, m); // id-keyed -- exact ordering, no duplicates across pages
   viewingHasMore = data.has_more;
   viewingNextAfterId = data.next_after_id != null ? data.next_after_id : viewingNextAfterId;
+  if (!viewingHasMore) {
+    // Backlog is now fully loaded -- safe to flush anything that arrived
+    // live while we were still paging through history (no more hidden-gap
+    // risk once every id up to "now" is accounted for).
+    viewingBacklogComplete = true;
+    if (pendingLiveMessages.length) {
+      for (const m of pendingLiveMessages) viewingMessages.set(m.id, m);
+      pendingLiveMessages = [];
+    }
+  }
   renderTranscript();
+  document.getElementById("transcriptLoadMore").style.display = viewingHasMore ? "" : "none";
 }
 
 function renderTranscript() {
@@ -846,32 +1016,69 @@ function renderTranscript() {
           <div class="bubble">${esc(m.text)}</div>
         </div>`).join("")
     : `<div class="empty">no messages</div>`;
-  document.getElementById("transcriptLoadMore").style.display = viewingHasMore ? "" : "none";
+  if (pendingLiveMessages.length) {
+    body.innerHTML += `<div class="empty">${pendingLiveMessages.length} new message(s) arrived -- click "Load more" to reach them</div>`;
+  }
 }
 
-function closeTranscript(push = true) {
+// User-initiated close (button/Escape/backdrop): if the CURRENT history
+// entry is one WE pushed (state.pushed === true), go back to whatever
+// preceded it -- pushing a further "closed" entry forward instead left a
+// stale ?session=N entry ahead of the current position that a subsequent
+// Back would revisit and reopen (review pass 1, point 2, exact repro: open,
+// close, Back reopens). But if the current entry is the page's own base/
+// initial entry (a direct deep link, never pushed by us -- state.pushed is
+// false or the state predates our marker), back() would leave CollabHub
+// entirely; replaceState in place instead (review pass 2, point 1).
+function closeTranscript(viaHistory = false) {
   viewingSessionId = null;
   viewingSessionMeta = null;
   viewingMessages = new Map();
+  viewingBacklogComplete = false;
+  pendingLiveMessages = [];
+  drawerOpen = false;
   document.getElementById("drawerBackdrop").style.display = "none";
   document.getElementById("transcriptDrawer").style.display = "none";
-  if (push) history.pushState(null, "", location.pathname);
+  if (drawerOpenerEl) { try { drawerOpenerEl.focus(); } catch { /* element may be gone */ } }
+  drawerOpenerEl = null;
+  if (!viaHistory) {
+    const cur = history.state;
+    if (cur && cur.pushed) history.back();
+    else history.replaceState({ session: null, pushed: false }, "", location.pathname);
+  }
 }
 
 document.getElementById("historyLoadMore").addEventListener("click", loadMoreHistory);
 document.getElementById("transcriptLoadMore").addEventListener("click", loadMoreTranscript);
-document.getElementById("transcriptClose").addEventListener("click", () => closeTranscript(true));
-document.getElementById("drawerBackdrop").addEventListener("click", () => closeTranscript(true));
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && viewingSessionId != null) closeTranscript(true); });
+document.getElementById("transcriptClose").addEventListener("click", () => closeTranscript(false));
+document.getElementById("drawerBackdrop").addEventListener("click", () => closeTranscript(false));
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && drawerOpen) closeTranscript(false); });
+
+// Minimal focus trap while the drawer is open -- Tab/Shift+Tab cycles
+// through the drawer's own focusable controls instead of escaping to the
+// page behind it (review pass 2, point 4: "part of best product, not
+// cosmetic").
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Tab" || !drawerOpen) return;
+  const drawer = document.getElementById("transcriptDrawer");
+  const focusables = Array.from(
+    drawer.querySelectorAll('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])')
+  ).filter(el => el.offsetParent !== null);
+  if (!focusables.length) return;
+  const first = focusables[0], last = focusables[focusables.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+});
 
 // Deep link: ?session=N opens on load. Browser back/forward already changed
-// the URL by the time popstate fires, so this only reacts to it -- pushing
-// another history entry here would create a broken back-button loop
-// (OpenClaw's review, point 9).
+// the URL by the time popstate fires, so this only REACTS to it (viaHistory
+// = true everywhere here) -- pushing/calling history.back() again in
+// response to a popstate would fight the navigation that just happened.
 window.addEventListener("popstate", () => {
   const sid = new URLSearchParams(location.search).get("session");
-  if (sid) openTranscript(parseInt(sid, 10), false);
-  else closeTranscript(false);
+  if (sid == null) { closeTranscript(true); return; }
+  if (SESSION_ID_RE.test(sid)) { openTranscript(parseInt(sid, 10), false); return; }
+  showInvalidSessionId(sid);
 });
 
 connectSSE();
@@ -881,7 +1088,17 @@ setInterval(renderPresence, 5000);
 refreshHistoryList();
 {
   const deepLinkSession = new URLSearchParams(location.search).get("session");
-  if (deepLinkSession) openTranscript(parseInt(deepLinkSession, 10), false);
+  // Claim this page's very first history entry as our own base state,
+  // marked `pushed: false` -- closeTranscript uses that marker to tell "a
+  // state we pushed" (safe to history.back() from) apart from "the entry
+  // this tab started on" (must replaceState, not back(), or a direct deep
+  // link's Close/Escape would navigate the user out of CollabHub entirely --
+  // review pass 2, point 1).
+  history.replaceState({ session: deepLinkSession, pushed: false }, "", location.href);
+  if (deepLinkSession != null) {
+    if (SESSION_ID_RE.test(deepLinkSession)) openTranscript(parseInt(deepLinkSession, 10), false);
+    else showInvalidSessionId(deepLinkSession);
+  }
 }
 </script>
 </body>

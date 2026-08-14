@@ -633,36 +633,45 @@ def list_chat_sessions(limit: int = 20) -> list[dict]:
 def list_chat_sessions_paginated(cursor: int | None = None, limit: int = 20) -> dict:
     """Cursor-paginated session index -- offset pagination silently skips or
     duplicates rows when new sessions are created between page fetches;
-    cursoring on a strictly-decreasing id doesn't (OpenClaw's review). The
-    active session (if any) is pinned first on page 1 ONLY, and excluded from
-    the normal cursor query so it can never appear twice across pages -- it's
+    cursoring on a strictly-decreasing id doesn't (OpenClaw's review).
+
+    `limit` is a hard maximum on `sessions` -- always. The active session (if
+    any) is returned separately as `pinned_active`, not folded into
+    `sessions` -- OpenClaw's explicit call on review: silently returning
+    limit+1 rows when a session happens to be active is surprising,
+    state-dependent API behavior even if documented; a caller that wants it
+    combined can concat the two arrays itself. `pinned_active` is only
+    populated on page 1 (cursor is None) and is always excluded from the
+    normal cursor query, so it can never appear twice across pages -- it's
     always the highest id anyway (only one session is ever active, and a new
     one can't start while another is active), so this exclusion is exact, not
     a heuristic."""
+    if cursor is not None and cursor < 0:
+        raise ValueError("cursor must be >= 0")
     limit = max(1, min(limit, 100))
     with _connect() as conn:
-        active = None
+        pinned_active = None
         if cursor is None:
             row = conn.execute(
                 "SELECT * FROM chat_sessions WHERE status='active' ORDER BY id DESC LIMIT 1"
             ).fetchone()
-            active = dict(row) if row else None
+            pinned_active = dict(row) if row else None
 
         q = "SELECT * FROM chat_sessions WHERE 1=1"
         params: list[Any] = []
         if cursor is not None:
             q += " AND id < ?"
             params.append(cursor)
-        if active:
+        if pinned_active:
             q += " AND id != ?"
-            params.append(active["id"])
+            params.append(pinned_active["id"])
         q += " ORDER BY id DESC LIMIT ?"
         params.append(limit + 1)  # fetch one extra to detect has_more without a second COUNT query
         rows = conn.execute(q, params).fetchall()
         has_more = len(rows) > limit
         page = [dict(r) for r in rows[:limit]]
 
-        all_sessions = ([active] if active else []) + page
+        all_sessions = ([pinned_active] if pinned_active else []) + page
         ids = [s["id"] for s in all_sessions]
         counts: dict[int, int] = {}
         linked_map: dict[int, list[dict]] = {}
@@ -692,7 +701,12 @@ def list_chat_sessions_paginated(cursor: int | None = None, limit: int = 20) -> 
             s["linked_tasks"] = linked_map.get(s["id"], [])
 
         next_cursor = page[-1]["id"] if page and has_more else None
-        return {"sessions": all_sessions, "next_cursor": next_cursor, "has_more": has_more}
+        return {
+            "pinned_active": pinned_active,
+            "sessions": page,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+        }
 
 
 def get_chat_session(session_id: int) -> dict | None:
