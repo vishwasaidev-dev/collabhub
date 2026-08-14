@@ -295,6 +295,21 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "app": "collabhub"})
 
 
+async def agent_briefing(request: Request) -> Response:
+    """Serves AGENT_BRIEFING.md fresh from disk on every request (unlike
+    _INDEX_HTML, not cached at import time) -- OpenClaw's WSL sandbox has no
+    filesystem access to this Windows repo checkout, same reason /files/
+    exists at all, so the doc needs to be reachable over the same network
+    path as everything else it can already fetch. Read live rather than
+    copied into shared_files/ so it can never drift out of sync with a git
+    commit -- one source of truth, not two."""
+    try:
+        content = (ROOT / "AGENT_BRIEFING.md").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return JSONResponse({"error": "AGENT_BRIEFING.md not found on disk"}, status_code=404)
+    return Response(content, media_type="text/markdown; charset=utf-8")
+
+
 async def state_endpoint(request: Request) -> JSONResponse:
     return JSONResponse(storage.full_state())
 
@@ -644,6 +659,7 @@ def build_app() -> Starlette:
         routes=[
             Route("/", index),
             Route("/health", health),
+            Route("/AGENT_BRIEFING.md", agent_briefing),
             Route("/api/state", state_endpoint),
             Route("/api/chat/active", chat_active),
             Route("/api/chat/start", chat_start, methods=["POST"]),
