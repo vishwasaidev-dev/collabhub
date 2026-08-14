@@ -12,7 +12,9 @@ notification path per feature.
 from __future__ import annotations
 
 import json
+import os
 import re
+import secrets
 import sqlite3
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -32,6 +34,46 @@ CHECKLIST_MAX_ITEMS_PER_TASK = 50
 # omission and explicit-null are different operations and must stay
 # distinguishable through both REST and MCP).
 _OMITTED = object()
+
+# --- File attachments (tranche 5) constants ---------------------------------
+# Gitignored, sibling to shared_files/ -- deliberately its own directory, not
+# reused: shared_files/ is fed by files *I* deliberately place there, an
+# open upload surface fed by anyone/anything is a different trust model
+# (OpenClaw's review). Kept outside every StaticFiles mount -- the only path
+# to a file in here is id -> DB storage_name -> this directory, never a raw
+# path from a request.
+ATTACHMENT_DIR = Path(__file__).resolve().parent / "attachments"
+# Environment-configurable per OpenClaw's review -- defaults are a starting
+# point, not hardcoded forever. MiB defined as 1024*1024, not 1_000_000.
+MiB = 1024 * 1024
+MAX_ATTACHMENT_BYTES = int(os.environ.get("COLLABHUB_MAX_ATTACHMENT_BYTES", 10 * MiB))
+MAX_ATTACHMENTS_PER_TASK = int(os.environ.get("COLLABHUB_MAX_ATTACHMENTS_PER_TASK", 20))
+# Global cap across ALL tasks -- unlimited tasks x a per-task cap is still an
+# unbounded disk-DoS; this closes that (OpenClaw's review).
+MAX_TOTAL_ATTACHMENT_BYTES = int(os.environ.get("COLLABHUB_MAX_TOTAL_ATTACHMENT_BYTES", 1024 * MiB))
+# The exact grammar every generated storage_name must match -- also
+# re-validated against this pattern before any filesystem operation touches
+# a name read back from the DB, as defense against DB corruption/tampering
+# ever translating into a path outside ATTACHMENT_DIR (OpenClaw's review).
+STORAGE_NAME_RE = re.compile(r"^[0-9a-f]{32}$")
+ATTACHMENT_FILENAME_MAX_LEN = 200
+
+
+def generate_storage_name() -> str:
+    return secrets.token_hex(16)  # 32 lowercase hex chars -- matches STORAGE_NAME_RE
+
+
+def _validate_storage_name(name: str) -> None:
+    if not STORAGE_NAME_RE.match(name):
+        raise ValueError(f"storage_name {name!r} does not match the expected token grammar")
+
+
+def attachment_path(storage_name: str) -> Path:
+    """The only function that turns a storage_name into a filesystem path --
+    validates the grammar first so a corrupted/tampered DB row can never
+    resolve outside ATTACHMENT_DIR (OpenClaw's review)."""
+    _validate_storage_name(storage_name)
+    return ATTACHMENT_DIR / storage_name
 
 
 def _validate_due_date(value: str) -> None:
@@ -99,6 +141,7 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
 
 
 def init_db() -> None:
+    ATTACHMENT_DIR.mkdir(parents=True, exist_ok=True)
     with _connect() as conn:
         conn.execute(
             """
@@ -250,6 +293,36 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_checklist_task ON task_checklist_items(task_id)")
 
+        # File attachments (tranche 5). storage_name is a server-generated
+        # opaque token (never derived from the uploaded filename) -- the
+        # ACTUAL on-disk name, under ATTACHMENT_DIR, outside every StaticFiles
+        # mount. `filename`/`mime_type` are untrusted display metadata only,
+        # never used to build a filesystem path or trusted for the served
+        # Content-Type (every download is forced to application/octet-stream
+        # regardless -- OpenClaw's review). sha256 is computed while
+        # streaming the upload to disk, for integrity/debugging/dedup-by-hash
+        # if ever wanted later. ON DELETE CASCADE for the same reason as
+        # checklist items -- an attachment has no independent existence once
+        # its task is gone -- but unlike checklist items, the CASCADE only
+        # cleans up the DB row; the on-disk bytes need an explicit unlink
+        # (delete_task collects storage_names before the cascade fires).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                filename TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+                sha256 TEXT NOT NULL,
+                storage_name TEXT NOT NULL UNIQUE,
+                uploaded_by TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_task ON attachments(task_id, created_at)")
+
         # Unified full-text search index (tranche 3). `content` is the only
         # tokenized/searchable column; everything else is UNINDEXED metadata
         # carried alongside each row so a search hit can be displayed and
@@ -368,6 +441,7 @@ def catch_up(agent: str, after_cursor: int | None = None) -> dict:
         ).fetchall()
         my_tasks = [_task_row_to_dict(r) for r in my_tasks_rows]
         _hydrate_checklists(conn, my_tasks)
+        _hydrate_attachments(conn, my_tasks)
         active_chat = conn.execute(
             "SELECT * FROM chat_sessions WHERE status='active' ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -441,6 +515,30 @@ def _hydrate_checklists(conn: sqlite3.Connection, tasks: list[dict]) -> None:
         t["checklist_progress"] = {"done": sum(1 for i in items if i["done"]), "total": len(items)}
 
 
+def _attachment_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return dict(row)
+
+
+def _hydrate_attachments(conn: sqlite3.Connection, tasks: list[dict]) -> None:
+    """Batched (no N+1), same pattern as _hydrate_checklists -- every
+    task-shape function gets the same attachments list, not just get_task.
+    Metadata only, no binary content ever appears in a task shape
+    (OpenClaw's review)."""
+    if not tasks:
+        return
+    task_ids = [t["id"] for t in tasks]
+    placeholders = ",".join("?" * len(task_ids))
+    rows = conn.execute(
+        f"SELECT * FROM attachments WHERE task_id IN ({placeholders}) ORDER BY task_id, created_at ASC, id ASC",
+        task_ids,
+    ).fetchall()
+    by_task: dict[int, list[dict]] = {}
+    for r in rows:
+        by_task.setdefault(r["task_id"], []).append(_attachment_to_dict(r))
+    for t in tasks:
+        t["attachments"] = by_task.get(t["id"], [])
+
+
 def create_task(
     title: str, description: str = "", created_by: str = "", tags: list[str] | None = None,
     priority: str = "normal", due_date: str | None = None,
@@ -462,6 +560,7 @@ def create_task(
         task = _task_row_to_dict(row)
         task["checklist_items"] = []
         task["checklist_progress"] = {"done": 0, "total": 0}
+        task["attachments"] = []
         _emit_event(conn, "task_created", {"task_id": task_id, "title": title, "created_by": created_by})
         _touch_presence(conn, created_by, "create_task")
         _index_for_search(conn, "task", task_id, None, _task_search_content(title, description, tags_str), created_by, now)
@@ -484,6 +583,7 @@ def list_tasks(status: str | None = None, assignee: str | None = None) -> list[d
         rows = conn.execute(q, params).fetchall()
         tasks = [_task_row_to_dict(r) for r in rows]
         _hydrate_checklists(conn, tasks)
+        _hydrate_attachments(conn, tasks)
         return tasks
 
 
@@ -502,6 +602,7 @@ def get_task(task_id: int) -> dict | None:
         # full objects).
         task["chat_sessions"] = _task_chat_session_summaries(conn, task_id)
         _hydrate_checklists(conn, [task])
+        _hydrate_attachments(conn, [task])
         return task
 
 
@@ -635,6 +736,151 @@ def delete_checklist_item(task_id: int, item_id: int) -> bool:
         conn.execute("UPDATE tasks SET updated_at=? WHERE id=?", (now, task_id))
         _emit_event(conn, "checklist_item_removed", {"task_id": task_id, "item_id": item_id})
         return True
+
+
+def create_attachment(
+    task_id: int, filename: str, mime_type: str, size_bytes: int, sha256: str,
+    storage_name: str, uploaded_by: str = "",
+) -> dict:
+    """Called AFTER the file has already been fully, successfully written to
+    disk at attachment_path(storage_name) -- this function's only job is the
+    DB side and never touches the filesystem itself. On any failure raised
+    here, the caller is responsible for unlinking the already-written file
+    (it's still just an inert, unreferenced blob at that point, not yet a
+    dangling DB reference)."""
+    _validate_storage_name(storage_name)
+    filename = (filename or "").strip()
+    if not filename:
+        raise ValueError("filename must not be empty")
+    if len(filename) > ATTACHMENT_FILENAME_MAX_LEN:
+        raise ValueError(f"filename must be <= {ATTACHMENT_FILENAME_MAX_LEN} characters")
+    if size_bytes < 0:
+        raise ValueError("size_bytes must be >= 0")
+    if size_bytes > MAX_ATTACHMENT_BYTES:
+        raise ValueError(f"attachment exceeds the {MAX_ATTACHMENT_BYTES}-byte per-file limit")
+    with _connect() as conn:
+        # BEGIN IMMEDIATE grabs the write lock BEFORE the count/quota reads
+        # below -- the default deferred-transaction behavior only acquires a
+        # write lock at the first INSERT/UPDATE, which would let two
+        # concurrent uploads both read "under the cap" before either
+        # commits, together landing over it. This is the exact race
+        # OpenClaw's review called out; BEGIN IMMEDIATE serializes
+        # concurrent create_attachment calls against each other (a second
+        # caller blocks here, up to the connection's own timeout, until the
+        # first transaction resolves) so the re-check that follows is
+        # actually against up-to-date state.
+        conn.execute("BEGIN IMMEDIATE")
+        task = conn.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not task:
+            raise NotFoundError(f"task {task_id} not found")
+        count = conn.execute(
+            "SELECT COUNT(*) AS c FROM attachments WHERE task_id=?", (task_id,)
+        ).fetchone()["c"]
+        if count >= MAX_ATTACHMENTS_PER_TASK:
+            raise ValueError(f"task {task_id} already has the maximum of {MAX_ATTACHMENTS_PER_TASK} attachments")
+        total = conn.execute("SELECT COALESCE(SUM(size_bytes), 0) AS s FROM attachments").fetchone()["s"]
+        if total + size_bytes > MAX_TOTAL_ATTACHMENT_BYTES:
+            raise ValueError(f"global attachment storage quota ({MAX_TOTAL_ATTACHMENT_BYTES} bytes) would be exceeded")
+        now = _now()
+        try:
+            cur = conn.execute(
+                "INSERT INTO attachments (task_id, filename, mime_type, size_bytes, sha256, storage_name, uploaded_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, filename, mime_type or "application/octet-stream", size_bytes, sha256, storage_name, uploaded_by, now),
+            )
+        except sqlite3.IntegrityError as exc:
+            # Defense in depth: the filesystem-level exclusive finalize
+            # (os.link in app.py's upload handler) is what actually
+            # prevents a storage_name collision from ever reaching this
+            # INSERT in normal operation, but this UNIQUE constraint is the
+            # backstop if that guarantee is ever violated by a different
+            # code path -- translate it into the same clean ValueError every
+            # other validation failure here uses, not an uncaught 500.
+            raise ValueError(f"storage_name collision: {exc}") from None
+        attachment_id = cur.lastrowid
+        row = conn.execute("SELECT * FROM attachments WHERE id=?", (attachment_id,)).fetchone()
+        item = _attachment_to_dict(row)
+        conn.execute("UPDATE tasks SET updated_at=? WHERE id=?", (now, task_id))
+        _emit_event(conn, "attachment_added", {"task_id": task_id, "attachment_id": attachment_id, "filename": filename, "size_bytes": size_bytes})
+        return item
+
+
+def list_attachments(task_id: int) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM attachments WHERE task_id=? ORDER BY created_at ASC, id ASC", (task_id,)
+        ).fetchall()
+        return [_attachment_to_dict(r) for r in rows]
+
+
+def get_attachment(attachment_id: int) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM attachments WHERE id=?", (attachment_id,)).fetchone()
+        return _attachment_to_dict(row) if row else None
+
+
+def delete_attachment(task_id: int, attachment_id: int) -> dict:
+    """Idempotent and task-scoped, same shape as delete_checklist_item.
+    Returns {"removed": bool, "storage_name": str|None} rather than a bare
+    bool -- the DB row is removed in THIS transaction (with the task bump +
+    event), but the actual on-disk unlink happens in the caller after this
+    returns, so a failed unlink doesn't roll back an otherwise-successful
+    delete: an unlink failure becomes a recorded orphan for
+    reconcile_attachment_storage() to catch later, never a phantom DB row
+    that still claims to exist (OpenClaw's review)."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM attachments WHERE id=? AND task_id=?", (attachment_id, task_id)
+        ).fetchone()
+        if not row:
+            return {"removed": False, "storage_name": None}
+        storage_name = row["storage_name"]
+        now = _now()
+        conn.execute("DELETE FROM attachments WHERE id=?", (attachment_id,))
+        conn.execute("UPDATE tasks SET updated_at=? WHERE id=?", (now, task_id))
+        _emit_event(conn, "attachment_removed", {"task_id": task_id, "attachment_id": attachment_id})
+        return {"removed": True, "storage_name": storage_name}
+
+
+def reconcile_attachment_storage() -> dict:
+    """Reconciles ATTACHMENT_DIR against the attachments table -- meant to
+    run once at process startup. A crash mid-upload can leave an orphaned
+    `.part` file; a crash between finalizing the file and committing the DB
+    row can leave a finalized-but-unreferenced file. Never deletes anything
+    that doesn't match the exact token grammar (with or without a `.part`
+    suffix) -- a stray unrelated file in the directory (there shouldn't be
+    one, but never trust that) is left alone and only reported, matching
+    attachment_path()'s own "never resolve outside the known grammar" rule
+    (OpenClaw's review)."""
+    ATTACHMENT_DIR.mkdir(parents=True, exist_ok=True)
+    with _connect() as conn:
+        known = {r["storage_name"] for r in conn.execute("SELECT storage_name FROM attachments").fetchall()}
+    removed_parts, removed_orphans, missing = [], [], []
+    for path in ATTACHMENT_DIR.iterdir():
+        if not path.is_file():
+            continue
+        name = path.name
+        if name.endswith(".part"):
+            token = name[: -len(".part")]
+            if STORAGE_NAME_RE.match(token):
+                try:
+                    path.unlink()
+                    removed_parts.append(name)
+                except OSError:
+                    pass
+            continue
+        if not STORAGE_NAME_RE.match(name):
+            continue  # not one of ours -- never touch it
+        if name not in known:
+            try:
+                path.unlink()
+                removed_orphans.append(name)
+            except OSError:
+                pass
+    for storage_name in known:
+        if not attachment_path(storage_name).exists():
+            missing.append(storage_name)
+    return {"removed_part_files": removed_parts, "removed_orphaned_files": removed_orphans, "rows_with_missing_files": missing}
 
 
 def add_comment(task_id: int, author: str, text: str) -> dict | None:
@@ -1238,8 +1484,17 @@ def rebuild_search_index() -> int:
 # repeatably instead of hand-editing the DB file.
 
 def delete_task(task_id: int) -> bool:
+    # Attachment storage_names are collected BEFORE the cascade fires and
+    # unlinked AFTER the transaction commits, not inside it -- filesystem
+    # I/O has no place in a SQLite transaction, and if an unlink happens to
+    # fail after a successful commit, that's a recorded orphan for
+    # reconcile_attachment_storage() to catch later, not a reason to fail
+    # (or worse, half-fail) the task deletion itself (OpenClaw's review).
     with _connect() as conn:
         comment_ids = [r["id"] for r in conn.execute("SELECT id FROM comments WHERE task_id=?", (task_id,)).fetchall()]
+        attachment_storage_names = [
+            r["storage_name"] for r in conn.execute("SELECT storage_name FROM attachments WHERE task_id=?", (task_id,)).fetchall()
+        ]
         conn.execute("DELETE FROM task_chat_sessions WHERE task_id=?", (task_id,))
         conn.execute("DELETE FROM comments WHERE task_id=?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
@@ -1248,7 +1503,13 @@ def delete_task(task_id: int) -> bool:
             conn.execute("DELETE FROM search_index WHERE rowid=?", (_search_rowid("task", task_id),))
             for cid in comment_ids:
                 conn.execute("DELETE FROM search_index WHERE rowid=?", (_search_rowid("comment", cid),))
-        return removed
+    if removed:
+        for storage_name in attachment_storage_names:
+            try:
+                attachment_path(storage_name).unlink(missing_ok=True)
+            except (ValueError, OSError):
+                pass  # bad grammar or unlink failure -- reconcile_attachment_storage() will report it later
+    return removed
 
 
 def delete_note(note_id: int) -> bool:
@@ -1413,6 +1674,7 @@ def full_state() -> dict:
         conn.execute("BEGIN")
         tasks = [_task_row_to_dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY updated_at DESC").fetchall()]
         _hydrate_checklists(conn, tasks)
+        _hydrate_attachments(conn, tasks)
         notes = [dict(r) for r in conn.execute("SELECT * FROM notes ORDER BY created_at DESC LIMIT 100").fetchall()]
         active_chat_row = conn.execute(
             "SELECT * FROM chat_sessions WHERE status='active' ORDER BY id DESC LIMIT 1"

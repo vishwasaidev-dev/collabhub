@@ -16,20 +16,24 @@ with "Task group is not initialized").
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import re
 import subprocess
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -40,6 +44,15 @@ ROOT = Path(__file__).resolve().parent
 _INDEX_HTML = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
 
 storage.init_db()
+# Reconcile the attachment directory against the DB once at process start --
+# a crash mid-upload, or between finalizing a file and committing its DB
+# row, can leave a stray `.part` file or an unreferenced-but-finalized file
+# behind; this cleans those up (and reports, without deleting, any DB row
+# whose bytes are missing) rather than letting them accumulate silently
+# across restarts (OpenClaw's review, tranche 5).
+_attachment_reconcile_report = storage.reconcile_attachment_storage()
+if any(_attachment_reconcile_report.values()):
+    print(f"[collabhub] attachment storage reconciliation on startup: {_attachment_reconcile_report}")
 
 mcp = FastMCP(
     "collabhub",
@@ -126,6 +139,17 @@ def toggle_checklist_item_tool(task_id: int, item_id: int, done: bool) -> dict:
 @mcp.tool(name="delete_checklist_item", description="Remove a checklist item. Idempotent -- returns whether anything was actually removed.")
 def delete_checklist_item_tool(task_id: int, item_id: int) -> bool:
     return storage.delete_checklist_item(task_id, item_id)
+
+
+@mcp.tool(name="list_attachments", description=(
+    "List a task's file attachments (metadata only -- filename, size, uploader, download URL "
+    "path -- never the file's bytes; those aren't representable in an MCP tool result, and "
+    "your sandbox likely can't reach local disk paths anyway. Fetch "
+    "GET /api/tasks/{task_id}/attachments/{id}/download over HTTP for the actual content, same "
+    "as the /files/ static mount."
+))
+def list_attachments_tool(task_id: int) -> list[dict]:
+    return storage.list_attachments(task_id)
 
 
 @mcp.tool(name="comment_task", description=(
@@ -631,6 +655,216 @@ async def task_checklist_delete(request: Request) -> JSONResponse:
     return JSONResponse({"removed": removed})
 
 
+# --- Attachments (tranche 5) -------------------------------------------
+# This is the project's first open upload/delete surface. Everything before
+# it was safe under "loopback-only, no auth, no network boundary worth
+# gating" (see the module docstring) because nothing here could cause real
+# harm if triggered from an unexpected origin. That's no longer true once a
+# request can write or delete files -- a hostile webpage open in the same
+# browser can reach 127.0.0.1 without any CORS opt-in on our side (a
+# same-origin "simple" multipart POST needs no preflight), and DNS
+# rebinding can make an attacker-controlled domain resolve to 127.0.0.1
+# after the fact while still looking same-origin to the browser. This check
+# is deliberately narrow: only the mutating attachment routes (upload,
+# delete) call it, not the read-only ones, and it allows a request with NO
+# Origin header at all through unconditionally (MCP clients, curl, this
+# project's own Playwright tests, and any same-machine CLI tool never send
+# one -- only a browser does) (OpenClaw's review).
+_TRUSTED_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
+
+
+def _check_trusted_origin(request: Request) -> JSONResponse | None:
+    host = request.url.hostname
+    if host not in _TRUSTED_HOSTNAMES:
+        return JSONResponse({"error": "untrusted Host"}, status_code=403)
+    origin = request.headers.get("origin")
+    if origin:
+        try:
+            origin_host = urlparse(origin).hostname
+        except ValueError:
+            origin_host = None
+        if origin_host not in _TRUSTED_HOSTNAMES:
+            return JSONResponse({"error": "cross-origin request rejected"}, status_code=403)
+    return None
+
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _sanitize_display_filename(filename: str, attachment_id: int) -> str:
+    """Only used for the Content-Disposition download filename -- never for
+    an actual filesystem path (that's always attachment.storage_name,
+    resolved through storage.attachment_path()'s own grammar check).
+    Starlette's FileResponse already percent-encodes anything outside a safe
+    character set for the header itself (so this isn't the only thing
+    standing between a malicious filename and header injection), but it
+    doesn't cap length, normalize Unicode, or fall back on a degenerate
+    name -- those are policy choices this function makes explicitly
+    (OpenClaw's review)."""
+    name = (filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = unicodedata.normalize("NFC", name)
+    name = _CONTROL_CHARS_RE.sub("", name).strip()
+    name = name[: storage.ATTACHMENT_FILENAME_MAX_LEN]
+    if not name or name in (".", ".."):
+        name = f"attachment-{attachment_id}"
+    return name
+
+
+async def task_attachments_list(request: Request) -> JSONResponse:
+    task_id = int(request.path_params["task_id"])
+    return JSONResponse(storage.list_attachments(task_id))
+
+
+async def task_attachment_upload(request: Request) -> JSONResponse:
+    task_id = int(request.path_params["task_id"])
+    origin_error = _check_trusted_origin(request)
+    if origin_error:
+        return origin_error
+
+    try:
+        form = await request.form()
+    except Exception:
+        return JSONResponse({"error": "could not parse multipart form data"}, status_code=400)
+
+    file_values = form.getlist("file")
+    if len(file_values) != 1:
+        return JSONResponse({"error": "exactly one 'file' field is required"}, status_code=400)
+    upload = file_values[0]
+    if not hasattr(upload, "read"):
+        # A plain text field named "file" (no filename) comes through as a
+        # bare str, not an UploadFile -- reject rather than crash on .read().
+        return JSONResponse({"error": "'file' field must be an uploaded file"}, status_code=400)
+
+    original_filename = (upload.filename or "").strip()
+    if not original_filename:
+        await upload.close()
+        return JSONResponse({"error": "uploaded file must have a filename"}, status_code=400)
+
+    # A claimed label, not authentication -- same treatment as every other
+    # author/uploaded_by field in this codebase: trim and cap, never trust.
+    uploaded_by = (form.get("uploaded_by") or "").strip()[:100]
+
+    storage.ATTACHMENT_DIR.mkdir(parents=True, exist_ok=True)
+    storage_name = storage.generate_storage_name()
+    part_path = storage.ATTACHMENT_DIR / f"{storage_name}.part"
+    final_path = storage.attachment_path(storage_name)
+
+    hasher = hashlib.sha256()
+    total = 0
+    write_error: tuple[int, str] | None = None
+    try:
+        # 'xb' = exclusive create -- refuses to open if the (randomly named,
+        # so collision is already astronomically unlikely) path already
+        # exists, rather than silently overwriting something. Written under
+        # a `.part` name and only atomically renamed to its final name once
+        # the full transfer is validated, so nothing can ever observe a
+        # partially-written file under a name attachment_path() would
+        # resolve to.
+        with open(part_path, "xb") as f:
+            while True:
+                chunk = await upload.read(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > storage.MAX_ATTACHMENT_BYTES:
+                    write_error = (400, f"attachment exceeds the {storage.MAX_ATTACHMENT_BYTES}-byte per-file limit")
+                    break
+                hasher.update(chunk)
+                f.write(chunk)
+        if write_error is None and total == 0:
+            write_error = (400, "uploaded file is empty")
+        if write_error is None:
+            # os.replace()/os.rename() both silently OVERWRITE an existing
+            # destination on POSIX and Windows alike -- os.link() is the
+            # portable primitive that instead FAILS if the destination
+            # already exists, giving a true exclusive finalize. In normal
+            # operation storage_name is a fresh 128-bit random token and a
+            # collision is cryptographically implausible, but a plain
+            # os.replace() here would have silently clobbered an already-
+            # finalized file's bytes on the (however unlikely) collision
+            # path instead of failing loudly -- caught by a dedicated test
+            # forcing a collision via monkeypatching, not just reasoned
+            # about (OpenClaw's review asked for token-collision evidence
+            # explicitly, and this is exactly what it found).
+            try:
+                os.link(part_path, final_path)
+            except FileExistsError:
+                write_error = (500, "storage name collision -- please retry")
+            else:
+                part_path.unlink(missing_ok=True)
+    except OSError:
+        write_error = (500, "upload failed while writing to disk")
+    finally:
+        await upload.close()
+
+    if write_error is not None:
+        # Only ever unlink part_path here, never final_path -- final_path
+        # is untouched in every failure case EXCEPT the collision path
+        # above, where it already belongs to a different, already-
+        # successful upload and must be left alone.
+        part_path.unlink(missing_ok=True)
+        status, message = write_error
+        return JSONResponse({"error": message}, status_code=status)
+
+    try:
+        item = storage.create_attachment(
+            task_id, original_filename, upload.content_type or "application/octet-stream",
+            total, hasher.hexdigest(), storage_name, uploaded_by,
+        )
+    except storage.NotFoundError as exc:
+        final_path.unlink(missing_ok=True)
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    except ValueError as exc:
+        final_path.unlink(missing_ok=True)
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse(item, status_code=201)
+
+
+async def task_attachment_download(request: Request) -> Response:
+    task_id = int(request.path_params["task_id"])
+    attachment_id = int(request.path_params["attachment_id"])
+    row = storage.get_attachment(attachment_id)
+    if not row or row["task_id"] != task_id:
+        return JSONResponse({"error": "attachment not found"}, status_code=404)
+    try:
+        path = storage.attachment_path(row["storage_name"])
+    except ValueError:
+        return JSONResponse({"error": "attachment storage reference is invalid"}, status_code=500)
+    if not path.exists():
+        # A row whose bytes are missing (e.g. a lost unlink race, or manual
+        # tampering) is a deliberate signal, not an arbitrary fallback --
+        # 410 Gone, and reconcile_attachment_storage() will surface it on
+        # the next startup too.
+        return JSONResponse({"error": "attachment bytes are missing"}, status_code=410)
+
+    display_name = _sanitize_display_filename(row["filename"], attachment_id)
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",  # never the claimed MIME, regardless of what it was (OpenClaw's review)
+        filename=display_name,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-store",
+            "Cross-Origin-Resource-Policy": "same-origin",
+        },
+    )
+
+
+async def task_attachment_delete(request: Request) -> JSONResponse:
+    task_id = int(request.path_params["task_id"])
+    attachment_id = int(request.path_params["attachment_id"])
+    origin_error = _check_trusted_origin(request)
+    if origin_error:
+        return origin_error
+    result = storage.delete_attachment(task_id, attachment_id)
+    if result["removed"] and result["storage_name"]:
+        try:
+            storage.attachment_path(result["storage_name"]).unlink(missing_ok=True)
+        except (ValueError, OSError):
+            pass  # DB delete already succeeded; a failed unlink is a recorded orphan, not a reason to fail this request
+    return JSONResponse(result)
+
+
 async def task_claim(request: Request) -> JSONResponse:
     body = await request.json()
     task = storage.update_task(int(request.path_params["task_id"]), status="in_progress", assignee=body.get("assignee", ""))
@@ -808,6 +1042,10 @@ def build_app() -> Starlette:
             Route("/api/tasks/{task_id:int}/checklist", task_checklist_create, methods=["POST"]),
             Route("/api/tasks/{task_id:int}/checklist/{item_id:int}", task_checklist_update, methods=["PATCH"]),
             Route("/api/tasks/{task_id:int}/checklist/{item_id:int}", task_checklist_delete, methods=["DELETE"]),
+            Route("/api/tasks/{task_id:int}/attachments", task_attachments_list),
+            Route("/api/tasks/{task_id:int}/attachments", task_attachment_upload, methods=["POST"]),
+            Route("/api/tasks/{task_id:int}/attachments/{attachment_id:int}/download", task_attachment_download),
+            Route("/api/tasks/{task_id:int}/attachments/{attachment_id:int}", task_attachment_delete, methods=["DELETE"]),
             Route("/api/tasks/{task_id:int}/link", task_link_session, methods=["POST"]),
             Route("/api/tasks/{task_id:int}/unlink", task_unlink_session, methods=["POST"]),
             Route("/api/notes", notes_list),

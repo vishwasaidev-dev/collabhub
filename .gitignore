@@ -7,3 +7,4 @@ collabhub.sqlite3-shm
 collabhub.log
 collabhub.err.log
 shared_files/
+attachments/
