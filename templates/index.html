@@ -177,6 +177,13 @@ let chatMessagesById = new Map();
 let presenceByAgent = new Map();
 let activeSession = null;   // {id, status, started_by, ...} | null
 let lastAppliedEventId = 0; // dedupe/idempotency gate -- ignore event.id <= this
+// True while a gap is open below lastAppliedEventId that a resync hasn't yet
+// closed (a task fetch failed AND the recovery resync itself also failed).
+// While true, NO event -- not even one whose own fetch would succeed -- may
+// advance the cursor; "a reconnect got scheduled" is not "the gap closed"
+// (OpenClaw's exact framing, re-review 2026-08-14). Only a successful full
+// resync clears it.
+let recoveryRequired = false;
 let pageLoadCursor = 0;     // event_cursor at initial load, for "N new" badges
 let newCounts = { tasks: 0, notes: 0, chat: 0 };
 
@@ -376,6 +383,24 @@ function queueApply(evt) {
 // each other's effect on tasksById (OpenClaw's review, point 3).
 async function applyEvent(evt) {
   if (evt.id <= lastAppliedEventId) return; // replay/duplicate -- already applied
+
+  if (recoveryRequired) {
+    // A gap is open below us that hasn't been closed by a successful resync
+    // yet. Do NOT process this event on its own merits, even if its own
+    // fetch would succeed -- that would let it commit a cursor past the
+    // still-open gap underneath it, exactly the leapfrog OpenClaw's
+    // re-review caught (a scheduled reconnect is not a closed gap; only a
+    // successful resync is). Instead, retry the resync; each new event
+    // arriving while gated becomes another retry attempt, on top of
+    // connectSSE's own independent backoff cycle.
+    try {
+      const cursor = await fullResyncSingleFlight();
+      lastAppliedEventId = Math.max(lastAppliedEventId, cursor);
+      recoveryRequired = false;
+    } catch { /* still broken -- stay gated; next event or the reconnect cycle retries */ }
+    return;
+  }
+
   const isNew = evt.id > pageLoadCursor;
 
   switch (evt.type) {
@@ -384,23 +409,22 @@ async function applyEvent(evt) {
     case "task_commented": {
       const task = await fetchTask(evt.payload.task_id);
       if (!task) {
-        // Transient fetch failure: reconcile with a full resync, and AWAIT
-        // it -- this runs inside the serialized queue (queueApply), so
-        // returning before the resync settles would let the next queued
-        // event run immediately and advance lastAppliedEventId past this
-        // gap before (or even if) the resync ever completes. Second bug in
-        // the same spot: fullResync() returns the cursor but was never
-        // actually assigned to lastAppliedEventId here, so even a completed
-        // resync wasn't closing the gap (OpenClaw's re-review, 2026-08-14 --
-        // caught both on a second pass after the first fix attempt).
+        // Transient fetch failure: open the recovery barrier immediately so
+        // no other in-flight/incoming event can slip past this gap, then try
+        // to close it with an awaited resync.
+        recoveryRequired = true;
         try {
           const cursor = await fullResyncSingleFlight();
           lastAppliedEventId = Math.max(lastAppliedEventId, cursor);
+          recoveryRequired = false;
         } catch {
-          // The resync itself failed -- don't swallow it and let later
-          // events leapfrog past an unresolved gap. Force the SSE
-          // reconnect path, which performs its own resync (with its own
-          // backoff/retry) and will close the gap once it succeeds.
+          // The resync itself failed too -- force the SSE reconnect path in
+          // the background (its own resync + backoff/retry), but do NOT
+          // clear recoveryRequired here: "reconnect scheduled" is not "gap
+          // closed" (OpenClaw's exact framing, second re-review 2026-08-14).
+          // The barrier stays up until some future resync -- from here, from
+          // a later gated event retrying, or from connectSSE's own eventual
+          // success -- actually completes.
           if (es) { es.close(); }
           connectSSE();
         }
@@ -495,6 +519,7 @@ async function connectSSE() {
   }
   if (pageLoadCursor === 0 && lastAppliedEventId === 0) pageLoadCursor = cursor; // only on very first connect
   lastAppliedEventId = Math.max(lastAppliedEventId, cursor);
+  recoveryRequired = false; // any successful full resync closes an open gap, whichever path triggered it
 
   if (es) { es.close(); }
   es = new EventSource(`/api/events/stream?since=${cursor}`);
