@@ -115,6 +115,11 @@ def list_notes_tool(limit: int = 50) -> list[dict]:
     return storage.list_notes(limit)
 
 
+@mcp.tool(name="get_note", description="Fetch one note by id, regardless of how far back it is -- list_notes only returns the newest slice.")
+def get_note_tool(note_id: int) -> dict | None:
+    return storage.get_note(note_id)
+
+
 @mcp.tool(name="start_chat_session", description=(
     "Start a live back-and-forth chat session with the other agent, or join the one "
     "already active (only one runs at a time). Returns the session, including its id -- "
@@ -164,11 +169,24 @@ def get_chat_session_tool(session_id: int) -> dict | None:
 
 
 @mcp.tool(name="get_chat_session_messages", description=(
-    "Paginated transcript for one session, oldest first. Pass the previous response's "
-    "next_after_id as after_id to fetch the next page. Returns null if the session doesn't exist."
+    "Paginated transcript for one session. Default is oldest-first: pass the previous response's "
+    "next_after_id as after_id to fetch the next (newer) page. Pass before_id instead (mutually "
+    "exclusive with after_id) to page backward/older -- e.g. continuing further back from a "
+    "get_chat_session_messages_around window. Returns null if the session doesn't exist."
 ))
-def get_chat_session_messages_tool(session_id: int, after_id: int = 0, limit: int = 50) -> dict | None:
-    return storage.get_chat_session_messages(session_id, after_id, limit)
+def get_chat_session_messages_tool(
+    session_id: int, after_id: int = 0, limit: int = 50, before_id: int | None = None,
+) -> dict | None:
+    return storage.get_chat_session_messages(session_id, after_id, limit, before_id)
+
+
+@mcp.tool(name="get_chat_session_messages_around", description=(
+    "Bounded window of messages centered on message_id, so you can jump straight to a specific "
+    "message (e.g. a search hit) without paging from the start. Raises if message_id doesn't "
+    "belong to session_id. Returns null if the session doesn't exist."
+))
+def get_chat_session_messages_around_tool(session_id: int, message_id: int, before: int = 25, after: int = 25) -> dict | None:
+    return storage.get_chat_session_messages_around(session_id, message_id, before, after)
 
 
 @mcp.tool(name="link_task_session", description=(
@@ -258,6 +276,17 @@ def list_presence_tool() -> list[dict]:
     return storage.list_presence()
 
 
+@mcp.tool(name="search", description=(
+    "Full-text search across tasks, task comments, notes, and chat messages. `types` (optional) "
+    "restricts to a subset, e.g. ['task','chat_message'] -- omit for all types. Results are "
+    "ranked by relevance, each with a snippet and enough context (parent task/session id+title/"
+    "status) to navigate to it -- for a chat_message hit, open its session with "
+    "get_chat_session_messages_around(session_id, source_id) to land right on the match."
+))
+def search_tool(q: str, types: list[str] | None = None, limit: int = 20, offset: int = 0) -> dict:
+    return storage.search(q, types, limit, offset)
+
+
 async def index(request: Request) -> HTMLResponse:
     return HTMLResponse(_INDEX_HTML)
 
@@ -340,10 +369,41 @@ async def chat_session_detail(request: Request) -> JSONResponse:
 
 async def chat_session_messages(request: Request) -> JSONResponse:
     session_id = int(request.path_params["session_id"])
-    after_id = int(request.query_params.get("after_id", 0))
-    limit = int(request.query_params.get("limit", 50))
+    # after_id and before_id are mutually exclusive -- checked on RAW query
+    # key presence, not on value, since after_id defaults to 0 and 0 is a
+    # legitimate explicit value (OpenClaw's live black-box catch: passing
+    # both was silently accepted, with before_id winning without warning).
+    before_id_param = request.query_params.get("before_id")
+    after_id_param = request.query_params.get("after_id")
+    if before_id_param is not None and after_id_param is not None:
+        return JSONResponse({"error": "after_id and before_id are mutually exclusive"}, status_code=400)
     try:
-        result = storage.get_chat_session_messages(session_id, after_id, limit)
+        limit = int(request.query_params.get("limit", 50))
+        before_id = int(before_id_param) if before_id_param is not None else None
+        after_id = int(after_id_param) if after_id_param is not None else 0
+    except ValueError:
+        return JSONResponse({"error": "limit/after_id/before_id must be integers"}, status_code=400)
+    try:
+        result = storage.get_chat_session_messages(session_id, after_id, limit, before_id)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    if result is None:
+        return JSONResponse({"error": "session not found"}, status_code=404)
+    return JSONResponse(result)
+
+
+async def chat_session_messages_around(request: Request) -> JSONResponse:
+    session_id = int(request.path_params["session_id"])
+    try:
+        message_id = int(request.query_params["message_id"])
+        before = int(request.query_params.get("before", 25))
+        after = int(request.query_params.get("after", 25))
+    except (KeyError, ValueError):
+        return JSONResponse({"error": "message_id, before, and after must be integers"}, status_code=400)
+    try:
+        result = storage.get_chat_session_messages_around(session_id, message_id, before, after)
+    except storage.NotFoundError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     if result is None:
@@ -461,6 +521,13 @@ async def notes_list(request: Request) -> JSONResponse:
     return JSONResponse(storage.list_notes(int(request.query_params.get("limit", 50))))
 
 
+async def note_get(request: Request) -> JSONResponse:
+    note = storage.get_note(int(request.path_params["note_id"]))
+    if note is None:
+        return JSONResponse({"error": "note not found"}, status_code=404)
+    return JSONResponse(note)
+
+
 async def notes_post(request: Request) -> JSONResponse:
     body = await request.json()
     return JSONResponse(storage.post_note(body.get("author", ""), body.get("text", "")))
@@ -489,6 +556,18 @@ async def ack_events_endpoint(request: Request) -> JSONResponse:
 
 async def presence_list(request: Request) -> JSONResponse:
     return JSONResponse(storage.list_presence())
+
+
+async def search_endpoint(request: Request) -> JSONResponse:
+    q = request.query_params.get("q", "")
+    types_param = request.query_params.get("types")
+    types = [t for t in types_param.split(",") if t] if types_param else None
+    limit = int(request.query_params.get("limit", 20))
+    offset = int(request.query_params.get("offset", 0))
+    try:
+        return JSONResponse(storage.search(q, types, limit, offset))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 def _ts() -> str:
@@ -573,6 +652,7 @@ def build_app() -> Starlette:
             Route("/api/chat/poll", chat_poll),
             Route("/api/chat/sessions", chat_sessions_list),
             Route("/api/chat/sessions/{session_id:int}/messages", chat_session_messages),
+            Route("/api/chat/sessions/{session_id:int}/messages/around", chat_session_messages_around),
             Route("/api/chat/sessions/{session_id:int}/export", chat_session_export),
             Route("/api/chat/sessions/{session_id:int}", chat_session_detail),
             Route("/api/tasks", tasks_list),
@@ -586,9 +666,11 @@ def build_app() -> Starlette:
             Route("/api/tasks/{task_id:int}/unlink", task_unlink_session, methods=["POST"]),
             Route("/api/notes", notes_list),
             Route("/api/notes", notes_post, methods=["POST"]),
+            Route("/api/notes/{note_id:int}", note_get),
             Route("/api/catchup", catch_up_endpoint, methods=["GET", "POST"]),
             Route("/api/ack", ack_events_endpoint, methods=["POST"]),
             Route("/api/presence", presence_list),
+            Route("/api/search", search_endpoint),
             Route("/api/events/stream", events_stream),
             WebSocketRoute("/ws/events", events_ws),
         ],

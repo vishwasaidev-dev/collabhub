@@ -148,6 +148,41 @@
     margin-right: 4px;
   }
 
+  .search-form {
+    display: flex; gap: 6px; margin-left: 16px; flex: 1; max-width: 360px;
+  }
+  .search-form input {
+    flex: 1; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-size: 13px;
+  }
+  .search-form button {
+    padding: 6px 12px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); font-size: 13px; cursor: pointer;
+  }
+  .search-form button:hover { background: var(--bg); }
+  .search-result {
+    padding: 10px 6px; border-radius: 8px; cursor: pointer; border: 1px solid transparent;
+    margin-bottom: 4px;
+  }
+  .search-result:hover, .search-result:focus { background: var(--bg); border-color: var(--border); }
+  .search-result .srhead { display: flex; gap: 8px; align-items: center; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .search-result .srtype {
+    text-transform: uppercase; letter-spacing: .03em; font-weight: 700; font-size: 10px;
+    padding: 1px 6px; border-radius: 999px; background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent);
+  }
+  .search-result .srsnippet { font-size: 13px; }
+  .search-result .srsnippet mark { background: color-mix(in srgb, var(--claimed) 35%, transparent); color: inherit; border-radius: 2px; }
+  .highlight-flash { animation: flash-highlight 2s ease-out; }
+  .comment-callout {
+    margin-top: 8px; padding: 6px 8px; border-radius: 8px; font-size: 12px;
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  }
+  @keyframes flash-highlight {
+    0% { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+    100% { background: transparent; }
+  }
+
   .drawer-backdrop {
     position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 20;
   }
@@ -181,8 +216,24 @@
 <header>
   <h1>CollabHub</h1>
   <span class="sub">shared task board + notes &mdash; Claude &amp; OpenClaw</span>
+  <form id="searchForm" class="search-form" role="search">
+    <input type="search" id="searchInput" placeholder="Search tasks, notes, chat&hellip;" aria-label="Search">
+    <button type="submit">Search</button>
+  </form>
   <span class="conn-status" id="connStatus"><span class="dot"></span><span id="connLabel">Connecting&hellip;</span></span>
 </header>
+<div class="drawer-backdrop" id="searchBackdrop" style="display:none;"></div>
+<div class="drawer search-drawer" id="searchDrawer" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="searchTitle">
+  <div class="drawer-head">
+    <h2 id="searchTitle">Search results</h2>
+    <div class="drawer-actions">
+      <button id="searchClose" class="drawer-close" aria-label="Close search results" tabindex="0">&times;</button>
+    </div>
+  </div>
+  <div class="drawer-meta" id="searchMeta"></div>
+  <div class="drawer-body" id="searchBody"></div>
+  <button class="loadmore" id="searchLoadMore" style="display:none;">Load more results</button>
+</div>
 <main>
   <div>
     <h2 class="clickable" id="boardHeader" style="font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:0 0 10px 2px;display:flex;align-items:center;gap:6px;">Task board <span class="newcount" id="tasksNew" style="display:none;"></span></h2>
@@ -219,6 +270,7 @@
     </div>
   </div>
   <div class="drawer-meta" id="transcriptMeta"></div>
+  <button class="loadmore" id="transcriptLoadEarlier" style="display:none;">Load earlier</button>
   <div class="drawer-body" id="transcriptBody"></div>
   <button class="loadmore" id="transcriptLoadMore" style="display:none;">Load more</button>
 </div>
@@ -280,7 +332,7 @@ function esc(s) {
 
 function taskCard(t) {
   return `
-    <div class="card">
+    <div class="card" data-task-id="${t.id}">
       <div class="title">#${t.id} ${esc(t.title)}</div>
       ${t.description ? `<div class="desc">${esc(t.description)}</div>` : ""}
       <div class="meta">
@@ -314,7 +366,7 @@ function renderNotes() {
   const notes = [...notesById.values()].sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
   document.getElementById("notes").innerHTML = notes.length
     ? notes.map(n => `
-        <div class="note">
+        <div class="note" data-note-id="${n.id}">
           <div class="head"><b>${esc(n.author || "?")}</b> &middot; <time>${fmtTime(n.created_at)}</time></div>
           <div class="text">${esc(n.text)}</div>
         </div>`).join("")
@@ -754,6 +806,9 @@ document.getElementById("chatHeader").addEventListener("click", () => { newCount
 // not silently open session 4, and NaN must never reach a /NaN request
 // (OpenClaw's review, point 5).
 const SESSION_ID_RE = /^[1-9]\d*$/;
+// Same shape as SESSION_ID_RE, applied to the ?message= deep-link param
+// (tranche 3 -- a search hit opens ?session=N&message=M).
+const MESSAGE_ID_RE = /^[1-9]\d*$/;
 
 let historyPinnedActive = null; // the active session, kept separate from `sessions`
 let historySessions = [];       // strictly <= the page limit -- limit is a hard max (OpenClaw's review, "pinned active" decision)
@@ -765,11 +820,19 @@ let viewingSessionMeta = null;
 let viewingMessages = new Map();
 let viewingNextAfterId = 0;
 let viewingHasMore = false;
+// Set when the drawer was opened onto a specific message (search hit) via
+// the around-message endpoint, rather than the normal oldest-first load.
+// Drives the scroll+highlight and the "Load earlier" control (tranche 3).
+let viewingTargetMessageId = null;
+let viewingEarliestLoadedId = null;
+let viewingHasMoreBefore = false;
 // While the historical backlog is still loading, live messages are parked
 // here instead of spliced into viewingMessages -- otherwise the transcript
 // would show [oldest loaded page] + [newest live message] with a hidden gap
 // of un-fetched ids in between, looking contiguous when it isn't (OpenClaw's
-// review, point 4).
+// review, point 4). For an around-message window, "backlog complete" means
+// has_more_after is false (nothing newer left to load), not the forward-
+// pagination has_more used in the normal oldest-first mode.
 let viewingBacklogComplete = false;
 let pendingLiveMessages = [];
 
@@ -881,6 +944,7 @@ function resetDrawerControls() {
   // could retain a stale href/visible state left over from whatever was
   // open previously (OpenClaw's review, point 5).
   document.getElementById("transcriptLoadMore").style.display = "none";
+  document.getElementById("transcriptLoadEarlier").style.display = "none";
   document.getElementById("transcriptExportJson").style.display = "none";
   document.getElementById("transcriptExportMd").style.display = "none";
 }
@@ -896,26 +960,33 @@ let drawerOpen = false;
 // nothing meaningful to restore focus to (OpenClaw's review pass 2, point 4).
 let drawerOpenerEl = null;
 
-function showInvalidSessionId(raw, originEl = null) {
+// General recoverable-error drawer state for any malformed/inconsistent
+// deep link -- distinct title/text per case, not one generic "Invalid
+// session" message reused for every failure mode (OpenClaw's review,
+// tranche 3 served-UI pass, point 6: a bad ?message= value showed the same
+// "not a valid session id" text as a bad ?session=).
+function showDeepLinkError(title, text, originEl = null) {
   viewingSessionId = null;
   drawerOpen = true;
   drawerOpenerEl = originEl;
   document.getElementById("drawerBackdrop").style.display = "";
   document.getElementById("transcriptDrawer").style.display = "flex";
-  document.getElementById("transcriptTitle").textContent = "Invalid session";
+  document.getElementById("transcriptTitle").textContent = title;
   document.getElementById("transcriptMeta").textContent = "";
-  document.getElementById("transcriptBody").innerHTML =
-    `<div class="drawer-error">"${esc(raw)}" is not a valid session id.</div>`;
+  document.getElementById("transcriptBody").innerHTML = `<div class="drawer-error">${esc(text)}</div>`;
   resetDrawerControls();
   document.getElementById("transcriptClose").focus();
 }
 
-async function openTranscript(sessionId, push = true, originEl = null) {
+async function openTranscript(sessionId, push = true, originEl = null, targetMessageId = null) {
   viewingSessionId = sessionId;
   viewingSessionMeta = null;
   viewingMessages = new Map();
   viewingNextAfterId = 0;
   viewingHasMore = false;
+  viewingTargetMessageId = targetMessageId;
+  viewingEarliestLoadedId = null;
+  viewingHasMoreBefore = false;
   viewingBacklogComplete = false;
   pendingLiveMessages = [];
   drawerOpen = true;
@@ -938,7 +1009,10 @@ async function openTranscript(sessionId, push = true, originEl = null) {
   // pass 2, point 1) -- back() is only safe on the former; a direct deep
   // link's initial entry has nothing "before" it in this tab worth leaving
   // the app for.
-  if (push) history.pushState({ session: sessionId, pushed: true }, "", "?session=" + sessionId);
+  if (push) {
+    const url = targetMessageId ? `?session=${sessionId}&message=${targetMessageId}` : `?session=${sessionId}`;
+    history.pushState({ session: sessionId, message: targetMessageId, pushed: true }, "", url);
+  }
 
   try {
     await fetchSessionMeta(sessionId);
@@ -959,7 +1033,84 @@ async function openTranscript(sessionId, push = true, originEl = null) {
   document.getElementById("transcriptExportMd").href = `/api/chat/sessions/${sessionId}/export?format=markdown`;
   document.getElementById("transcriptExportMd").style.display = "";
 
-  await loadMoreTranscript();
+  if (targetMessageId) await loadTranscriptAround(sessionId, targetMessageId);
+  else await loadMoreTranscript();
+}
+
+// Jump straight to a specific message (a search hit) without paging from
+// message 1 -- uses the bounded around-message window, then scrolls to and
+// highlights the target. A malformed/mismatched message id (wrong session,
+// nonexistent) surfaces as a recoverable error, same pattern as an invalid
+// session id, and stays inside CollabHub (tranche 3, per OpenClaw's review).
+async function loadTranscriptAround(sessionId, messageId) {
+  let data;
+  try {
+    const res = await fetch(
+      `/api/chat/sessions/${sessionId}/messages/around?message_id=${messageId}&before=25&after=25`,
+      { cache: "no-store" },
+    );
+    if (!res.ok) throw new Error("fetch failed: " + res.status);
+    data = await res.json();
+  } catch {
+    if (viewingSessionId === sessionId) {
+      document.getElementById("transcriptBody").innerHTML =
+        `<div class="drawer-error">Message #${messageId} not found in session #${sessionId}.</div>`;
+    }
+    return;
+  }
+  if (viewingSessionId !== sessionId) return;
+  viewingMessages = new Map(data.messages.map(m => [m.id, m]));
+  viewingEarliestLoadedId = data.earliest_loaded_id;
+  viewingNextAfterId = data.latest_loaded_id || 0; // forward "Load more" continues from here, not from 0
+  viewingHasMoreBefore = data.has_more_before;
+  viewingHasMore = data.has_more_after;
+  viewingBacklogComplete = !data.has_more_after; // nothing newer left to load -- safe to live-tail directly
+  renderTranscript();
+  document.getElementById("transcriptLoadEarlier").style.display = viewingHasMoreBefore ? "" : "none";
+  document.getElementById("transcriptLoadMore").style.display = viewingHasMore ? "" : "none";
+  requestAnimationFrame(() => {
+    const el = document.querySelector(`#transcriptBody [data-message-id="${messageId}"]`);
+    if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("highlight-flash"); }
+  });
+}
+
+async function loadEarlierTranscript() {
+  if (viewingSessionId == null || viewingEarliestLoadedId == null) return;
+  const sessionId = viewingSessionId;
+  // Preserve scroll position around the prepend -- without this, adding
+  // messages above the current view shifts everything down and the
+  // viewport visibly jumps (OpenClaw's review, secondary UX point). Anchor
+  // on the message that WAS earliest-loaded: it stays in the DOM after
+  // prepending, just no longer at the very top, so its position delta
+  // before/after tells us exactly how far to adjust scrollTop.
+  const anchorId = viewingEarliestLoadedId;
+  const body = document.getElementById("transcriptBody");
+  const anchorElBefore = body.querySelector(`[data-message-id="${anchorId}"]`);
+  const offsetBefore = anchorElBefore ? anchorElBefore.getBoundingClientRect().top : null;
+
+  let data;
+  try {
+    const res = await fetch(
+      `/api/chat/sessions/${sessionId}/messages?before_id=${viewingEarliestLoadedId}&limit=50`,
+      { cache: "no-store" },
+    );
+    if (!res.ok) throw new Error("fetch failed: " + res.status);
+    data = await res.json();
+  } catch { return; }
+  if (viewingSessionId !== sessionId) return;
+  for (const m of data.messages) viewingMessages.set(m.id, m);
+  viewingHasMoreBefore = data.has_more;
+  viewingEarliestLoadedId = data.messages.length ? data.messages[0].id : viewingEarliestLoadedId;
+  document.getElementById("transcriptLoadEarlier").style.display = viewingHasMoreBefore ? "" : "none";
+  renderTranscript();
+
+  if (offsetBefore != null) {
+    const anchorElAfter = body.querySelector(`[data-message-id="${anchorId}"]`);
+    if (anchorElAfter) {
+      const offsetAfter = anchorElAfter.getBoundingClientRect().top;
+      body.scrollTop += (offsetAfter - offsetBefore);
+    }
+  }
 }
 
 async function loadMoreTranscript() {
@@ -1011,7 +1162,7 @@ function renderTranscript() {
   const body = document.getElementById("transcriptBody");
   body.innerHTML = msgs.length
     ? msgs.map(m => `
-        <div class="msg ${esc(m.author)}">
+        <div class="msg ${esc(m.author)}" data-message-id="${m.id}">
           <div class="head"><b>${esc(m.author || "?")}</b> &middot; <time>${fmtTime(m.created_at)}</time></div>
           <div class="bubble">${esc(m.text)}</div>
         </div>`).join("")
@@ -1048,21 +1199,257 @@ function closeTranscript(viaHistory = false) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Search (tranche 3)
+// ---------------------------------------------------------------------------
+let searchOpen = false;
+let searchQuery = "";
+let searchOffset = 0;
+let searchHasMore = false;
+let searchResults = [];
+let searchOpenerEl = null;
+// Monotonic generation counter, not a `searchQuery !== q` string compare --
+// the string compare fails to detect staleness when the SAME query is
+// submitted twice in quick succession (the second response would still
+// match `searchQuery === q` even after a third, newer request superseded
+// it). Every request captures the generation at its start; a response is
+// only applied if that generation is still current when it returns
+// (OpenClaw's review, tranche 3 served-UI pass, point 2).
+let searchGeneration = 0;
+// Single-flight guard for "Load more" specifically -- double-clicking it
+// launched two requests at the same offset; de-dupe hid the duplicate rows
+// but offset still advanced twice, silently skipping a page (point 1).
+let searchLoadMoreInFlight = false;
+
+function closeSearch(viaHistory = false) {
+  searchOpen = false;
+  document.getElementById("searchBackdrop").style.display = "none";
+  document.getElementById("searchDrawer").style.display = "none";
+  if (searchOpenerEl) { try { searchOpenerEl.focus(); } catch { /* element may be gone */ } }
+  searchOpenerEl = null;
+}
+
+// Sentinel-based highlighting -- escape the WHOLE snippet first (any real
+// HTML in the indexed content, e.g. a stored <script>, becomes inert text),
+// THEN swap the sentinel control characters (which survive HTML-escaping
+// unchanged, since esc() only touches &<>") for real <mark> tags. Only our
+// own insertions ever become markup; anything user-supplied is always
+// escaped first (OpenClaw's review, tranche 3 -- never trust snippet()
+// output as HTML).
+function renderSnippet(raw) {
+  return esc(raw).replaceAll("\x01", "<mark>").replaceAll("\x02", "</mark>");
+}
+
+async function runSearchQuery(q, offset = 0) {
+  const params = new URLSearchParams({ q, limit: 20, offset });
+  const res = await fetch(`/api/search?${params}`, { cache: "no-store" });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || ("search failed: " + res.status));
+  }
+  return res.json();
+}
+
+async function doSearch(q, originEl = null) {
+  q = (q || "").trim();
+  if (!q) return;
+  const gen = ++searchGeneration; // this request now owns "current"; any older one is stale on arrival
+  searchQuery = q;
+  searchOffset = 0;
+  searchResults = [];
+  searchOpen = true;
+  searchOpenerEl = originEl;
+  document.getElementById("searchBackdrop").style.display = "";
+  document.getElementById("searchDrawer").style.display = "flex";
+  document.getElementById("searchTitle").textContent = `Search: "${q}"`;
+  document.getElementById("searchMeta").textContent = "";
+  document.getElementById("searchBody").innerHTML = `<div class="empty">Searching&hellip;</div>`;
+  document.getElementById("searchLoadMore").style.display = "none";
+  document.getElementById("searchClose").focus();
+
+  try {
+    const data = await runSearchQuery(q, 0);
+    if (gen !== searchGeneration) return; // superseded by a newer search while this was in flight
+    searchResults = data.results;
+    searchHasMore = data.has_more;
+    searchOffset = data.results.length;
+    renderSearchResults();
+  } catch (err) {
+    if (gen === searchGeneration) {
+      document.getElementById("searchBody").innerHTML = `<div class="drawer-error">${esc(err.message || "Search failed.")}</div>`;
+    }
+  }
+}
+
+async function loadMoreSearch() {
+  if (!searchHasMore || searchLoadMoreInFlight) return;
+  searchLoadMoreInFlight = true;
+  const gen = searchGeneration; // this page belongs to the CURRENT search; a fresh doSearch() call invalidates it
+  const btn = document.getElementById("searchLoadMore");
+  btn.disabled = true;
+  try {
+    const data = await runSearchQuery(searchQuery, searchOffset);
+    if (gen !== searchGeneration) return; // the user started a new search while this page was loading
+    // De-dupe defensively by (source_type, source_id) -- the corpus can
+    // mutate between page fetches, e.g. a new comment landing between
+    // "load more" clicks (OpenClaw's review).
+    const seen = new Set(searchResults.map(r => r.source_type + ":" + r.source_id));
+    for (const r of data.results) {
+      const key = r.source_type + ":" + r.source_id;
+      if (!seen.has(key)) { searchResults.push(r); seen.add(key); }
+    }
+    searchHasMore = data.has_more;
+    searchOffset += data.results.length;
+    renderSearchResults();
+  } catch {
+    if (gen === searchGeneration) {
+      const body = document.getElementById("searchBody");
+      const err = document.createElement("div");
+      err.className = "drawer-error";
+      err.innerHTML = `Could not load more results. <button type="button" id="searchRetryLoadMore">Retry</button>`;
+      body.appendChild(err);
+      document.getElementById("searchRetryLoadMore").addEventListener("click", () => { err.remove(); loadMoreSearch(); });
+    }
+  } finally {
+    searchLoadMoreInFlight = false;
+    btn.disabled = false;
+  }
+}
+
+function searchResultLabel(r) {
+  switch (r.source_type) {
+    case "task": return `Task #${r.source_id}`;
+    case "comment": return `Comment on #${r.context.task_id ?? "?"}${r.context.task_title ? ": " + r.context.task_title : ""}`;
+    case "note": return "Note";
+    case "chat_message": return `Chat session #${r.context.session_id ?? "?"}`;
+    default: return r.source_type;
+  }
+}
+
+function renderSearchResults() {
+  const el = document.getElementById("searchBody");
+  document.getElementById("searchMeta").textContent = searchResults.length
+    ? `${searchResults.length}${searchHasMore ? "+" : ""} result(s)` : "";
+  el.innerHTML = searchResults.length
+    ? searchResults.map((r, i) => `
+        <div class="search-result" data-index="${i}" role="button" tabindex="0"
+             aria-label="Open ${esc(searchResultLabel(r))}">
+          <div class="srhead"><span class="srtype">${esc(r.source_type.replace("_", " "))}</span>
+            <span>${esc(searchResultLabel(r))}</span>
+            <span>&middot; ${esc(r.author || "?")}</span>
+            <span>&middot; <time>${fmtTime(r.created_at)}</time></span>
+          </div>
+          <div class="srsnippet">${renderSnippet(r.snippet)}</div>
+        </div>`).join("")
+    : `<div class="empty">no results</div>`;
+  for (const row of el.querySelectorAll(".search-result")) {
+    const idx = parseInt(row.dataset.index, 10);
+    const open = () => openSearchResult(searchResults[idx], row);
+    row.addEventListener("click", open);
+    row.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
+  }
+  document.getElementById("searchLoadMore").style.display = searchHasMore ? "" : "none";
+}
+
+async function openSearchResult(r, originEl) {
+  // Always close search before navigating to the destination -- the two
+  // overlay drawers are never meant to stack (see the Escape/Tab handlers
+  // below, which assume only one is ever open at a time).
+  closeSearch(true);
+  if (r.source_type === "chat_message") {
+    // NOT originEl -- that's the search-result row, which just got hidden
+    // by closeSearch() above. Focusing a hidden element on transcript close
+    // would leave keyboard focus stuck somewhere invisible. The search
+    // input is the closest VISIBLE, still-meaningful place to return focus
+    // to (OpenClaw's review, tranche 3 served-UI pass, point 3).
+    await openTranscript(r.context.session_id, true, document.getElementById("searchInput"), r.source_id);
+  } else if (r.source_type === "task") {
+    await scrollAndHighlightTask(r.source_id, null);
+  } else if (r.source_type === "comment") {
+    await scrollAndHighlightTask(r.context.task_id, r.source_id);
+  } else if (r.source_type === "note") {
+    await scrollAndHighlightNote(r.source_id);
+  }
+}
+
+// matchedCommentId, if given, renders a callout identifying that SPECIFIC
+// comment (author + full text) on the highlighted card -- task cards don't
+// render their comments at all normally, so without this a comment search
+// hit would just highlight the parent task with no way to tell which of
+// its comments actually matched (OpenClaw's review, point 4).
+async function scrollAndHighlightTask(taskId, matchedCommentId) {
+  if (taskId == null) return;
+  let matchedComment = null;
+  if (!tasksById.has(taskId) || matchedCommentId != null) {
+    const t = await fetchTask(taskId);
+    if (t) {
+      tasksById.set(t.id, t);
+      renderBoard();
+      if (matchedCommentId != null) matchedComment = (t.comments || []).find(c => c.id === matchedCommentId) || null;
+    }
+  }
+  requestAnimationFrame(() => {
+    const el = document.querySelector(`#board .card[data-task-id="${taskId}"]`);
+    if (!el) return;
+    el.scrollIntoView({ block: "center" });
+    el.classList.add("highlight-flash");
+    const oldCallout = el.querySelector(".comment-callout");
+    if (oldCallout) oldCallout.remove();
+    if (matchedComment) {
+      const callout = document.createElement("div");
+      callout.className = "comment-callout";
+      callout.innerHTML = `<b>Matched comment</b> by ${esc(matchedComment.author || "?")}: ${esc(matchedComment.text)}`;
+      el.appendChild(callout);
+    }
+  });
+}
+
+async function scrollAndHighlightNote(noteId) {
+  if (!notesById.has(noteId)) {
+    // Exact-id fetch -- list_notes only returns the newest slice, so an
+    // older indexed note needs its own lookup, not a generous-limit guess
+    // that still has a ceiling (OpenClaw's review, point 5).
+    try {
+      const res = await fetch(`/api/notes/${noteId}`, { cache: "no-store" });
+      if (res.ok) {
+        const note = await res.json();
+        notesById.set(note.id, note);
+        renderNotes();
+      }
+    } catch { /* best effort -- note just won't be found below if this fails */ }
+  }
+  requestAnimationFrame(() => {
+    const el = document.querySelector(`#notes .note[data-note-id="${noteId}"]`);
+    if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("highlight-flash"); }
+  });
+}
+
 document.getElementById("historyLoadMore").addEventListener("click", loadMoreHistory);
 document.getElementById("transcriptLoadMore").addEventListener("click", loadMoreTranscript);
+document.getElementById("transcriptLoadEarlier").addEventListener("click", loadEarlierTranscript);
 document.getElementById("transcriptClose").addEventListener("click", () => closeTranscript(false));
 document.getElementById("drawerBackdrop").addEventListener("click", () => closeTranscript(false));
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && drawerOpen) closeTranscript(false); });
 
-// Minimal focus trap while the drawer is open -- Tab/Shift+Tab cycles
-// through the drawer's own focusable controls instead of escaping to the
-// page behind it (review pass 2, point 4: "part of best product, not
-// cosmetic").
+// Escape/Tab cover BOTH overlay drawers (transcript + search). Only one is
+// ever open at a time by construction (opening a search result always
+// closes the search panel first -- see openSearchResult), so there's no
+// real stacking-order ambiguity to resolve; check search first regardless.
 document.addEventListener("keydown", (e) => {
-  if (e.key !== "Tab" || !drawerOpen) return;
-  const drawer = document.getElementById("transcriptDrawer");
+  if (e.key !== "Escape") return;
+  if (searchOpen) closeSearch(false);
+  else if (drawerOpen) closeTranscript(false);
+});
+
+// Minimal focus trap while a drawer is open -- Tab/Shift+Tab cycles through
+// that drawer's own focusable controls instead of escaping to the page
+// behind it (review pass 2, point 4: "part of best product, not cosmetic").
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Tab") return;
+  const activeDrawer = searchOpen ? document.getElementById("searchDrawer")
+    : drawerOpen ? document.getElementById("transcriptDrawer") : null;
+  if (!activeDrawer) return;
   const focusables = Array.from(
-    drawer.querySelectorAll('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])')
+    activeDrawer.querySelectorAll('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])')
   ).filter(el => el.offsetParent !== null);
   if (!focusables.length) return;
   const first = focusables[0], last = focusables[focusables.length - 1];
@@ -1070,15 +1457,34 @@ document.addEventListener("keydown", (e) => {
   else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
 });
 
-// Deep link: ?session=N opens on load. Browser back/forward already changed
-// the URL by the time popstate fires, so this only REACTS to it (viaHistory
-// = true everywhere here) -- pushing/calling history.back() again in
-// response to a popstate would fight the navigation that just happened.
+document.getElementById("searchForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  doSearch(document.getElementById("searchInput").value, document.getElementById("searchInput"));
+});
+document.getElementById("searchClose").addEventListener("click", () => closeSearch(false));
+document.getElementById("searchBackdrop").addEventListener("click", () => closeSearch(false));
+document.getElementById("searchLoadMore").addEventListener("click", loadMoreSearch);
+
+// Deep link: ?session=N[&message=M] opens on load. Browser back/forward
+// already changed the URL by the time popstate fires, so this only REACTS
+// to it (viaHistory = true everywhere here) -- pushing/calling
+// history.back() again in response to a popstate would fight the
+// navigation that just happened.
 window.addEventListener("popstate", () => {
-  const sid = new URLSearchParams(location.search).get("session");
-  if (sid == null) { closeTranscript(true); return; }
-  if (SESSION_ID_RE.test(sid)) { openTranscript(parseInt(sid, 10), false); return; }
-  showInvalidSessionId(sid);
+  const params = new URLSearchParams(location.search);
+  const sid = params.get("session");
+  const mid = params.get("message");
+  if (sid == null) {
+    // A stray ?message=M with no ?session=N is an inconsistent link, not
+    // silently ignorable -- normalizing it away would hide a broken deep
+    // link instead of surfacing it (OpenClaw's review, point 6).
+    if (mid != null) showDeepLinkError("Invalid link", "A message link requires a session id.");
+    else closeTranscript(true);
+    return;
+  }
+  if (!SESSION_ID_RE.test(sid)) { showDeepLinkError("Invalid session", `"${sid}" is not a valid session id.`); return; }
+  if (mid != null && !MESSAGE_ID_RE.test(mid)) { showDeepLinkError("Invalid message", `"${mid}" is not a valid message id.`); return; }
+  openTranscript(parseInt(sid, 10), false, null, mid != null ? parseInt(mid, 10) : null);
 });
 
 connectSSE();
@@ -1087,7 +1493,9 @@ setInterval(fetchPresence, 15000);
 setInterval(renderPresence, 5000);
 refreshHistoryList();
 {
-  const deepLinkSession = new URLSearchParams(location.search).get("session");
+  const params = new URLSearchParams(location.search);
+  const deepLinkSession = params.get("session");
+  const deepLinkMessage = params.get("message");
   // Claim this page's very first history entry as our own base state,
   // marked `pushed: false` -- closeTranscript uses that marker to tell "a
   // state we pushed" (safe to history.back() from) apart from "the entry
@@ -1095,9 +1503,14 @@ refreshHistoryList();
   // link's Close/Escape would navigate the user out of CollabHub entirely --
   // review pass 2, point 1).
   history.replaceState({ session: deepLinkSession, pushed: false }, "", location.href);
-  if (deepLinkSession != null) {
-    if (SESSION_ID_RE.test(deepLinkSession)) openTranscript(parseInt(deepLinkSession, 10), false);
-    else showInvalidSessionId(deepLinkSession);
+  if (deepLinkSession == null) {
+    if (deepLinkMessage != null) showDeepLinkError("Invalid link", "A message link requires a session id.");
+  } else if (!SESSION_ID_RE.test(deepLinkSession)) {
+    showDeepLinkError("Invalid session", `"${deepLinkSession}" is not a valid session id.`);
+  } else if (deepLinkMessage != null && !MESSAGE_ID_RE.test(deepLinkMessage)) {
+    showDeepLinkError("Invalid message", `"${deepLinkMessage}" is not a valid message id.`);
+  } else {
+    openTranscript(parseInt(deepLinkSession, 10), false, null, deepLinkMessage != null ? parseInt(deepLinkMessage, 10) : null);
   }
 }
 </script>

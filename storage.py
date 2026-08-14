@@ -31,6 +31,22 @@ class NotFoundError(Exception):
     is a resource-not-found error, and conflating both into ValueError->400
     was wrong)."""
 
+
+# --- Search (tranche 3) constants -------------------------------------------
+SEARCH_TYPES = ("task", "comment", "note", "chat_message")
+_SEARCH_TYPE_CODE = {"task": 1, "comment": 2, "note": 3, "chat_message": 4}
+SEARCH_MAX_QUERY_LEN = 500
+SEARCH_MAX_TOKENS = 20
+SEARCH_MAX_LIMIT = 100
+# Non-printable sentinels for snippet() delimiters -- NOT literal HTML tags,
+# since the text around a match is raw user content and could itself contain
+# a stored <script> or literal "<mark>"-looking string. Escape the whole
+# snippet first, then swap these (which survive HTML-escaping unchanged)
+# for real <mark>/</mark> -- only our own insertions become tags
+# (OpenClaw's review, tranche 3 pre-build hardening).
+SNIPPET_START = "\x01"
+SNIPPET_END = "\x02"
+
 # Normalized token, not arbitrary text (OpenClaw's review, tranche 2,
 # 2026-08-14) -- keeps the join table's relation_type from ever becoming a
 # dumping ground for free-form/HTML-sized strings.
@@ -172,6 +188,36 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tcs_task ON task_chat_sessions(task_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tcs_session ON task_chat_sessions(session_id)")
+
+        # Unified full-text search index (tranche 3). `content` is the only
+        # tokenized/searchable column; everything else is UNINDEXED metadata
+        # carried alongside each row so a search hit can be displayed and
+        # linked back to its source without a second query per result.
+        # rowid is a stable composite key (type_code*10_000_000_000 +
+        # source_id) so a row can be deleted+reinserted on update without
+        # colliding across the four separate id spaces (task/comment/note/
+        # chat_message each have their own AUTOINCREMENT sequence).
+        search_index_existed = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='search_index'"
+        ).fetchone() is not None
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
+                content,
+                source_type UNINDEXED,
+                source_id UNINDEXED,
+                parent_id UNINDEXED,
+                author UNINDEXED,
+                created_at UNINDEXED
+            )
+            """
+        )
+        if not search_index_existed:
+            # First time this table has existed on this DB -- backfill every
+            # row that already exists so search covers pre-existing data
+            # immediately, not just writes from this point forward
+            # (OpenClaw's review, tranche 3).
+            _rebuild_search_index(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +362,7 @@ def create_task(title: str, description: str = "", created_by: str = "", tags: l
         task = _task_row_to_dict(row)
         _emit_event(conn, "task_created", {"task_id": task_id, "title": title, "created_by": created_by})
         _touch_presence(conn, created_by, "create_task")
+        _index_for_search(conn, "task", task_id, None, _task_search_content(title, description, tags_str), created_by, now)
         return task
 
 
@@ -384,6 +431,14 @@ def update_task(
         _emit_event(conn, "task_updated", {"task_id": task_id, "status": task["status"], "assignee": task.get("assignee")})
         if assignee:
             _touch_presence(conn, assignee, "update_task")
+        # Reindex unconditionally on any update, not just a description
+        # change -- cheap at this scale, and simpler than tracking exactly
+        # which fields affect the indexed content (OpenClaw's review).
+        _index_for_search(
+            conn, "task", task_id, None,
+            _task_search_content(task["title"], task["description"], row["tags"]),
+            task.get("created_by", ""), task["updated_at"],
+        )
         return task
 
 
@@ -402,6 +457,7 @@ def add_comment(task_id: int, author: str, text: str) -> dict | None:
         comment = dict(row)
         _emit_event(conn, "task_commented", {"task_id": task_id, "comment_id": comment["id"], "author": author, "text": text})
         _touch_presence(conn, author, "comment_task")
+        _index_for_search(conn, "comment", comment["id"], task_id, text, author, now)
         return comment
 
 
@@ -419,6 +475,7 @@ def post_note(author: str, text: str) -> dict:
         note = dict(row)
         _emit_event(conn, "note_posted", {"note_id": note["id"], "author": author, "text": text})
         _touch_presence(conn, author, "post_note")
+        _index_for_search(conn, "note", note["id"], None, text, author, now)
         return note
 
 
@@ -428,6 +485,15 @@ def list_notes(limit: int = 50) -> list[dict]:
             "SELECT * FROM notes ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_note(note_id: int) -> dict | None:
+    """Exact-id lookup -- list_notes only returns the newest slice, so a
+    search hit on an older note needs its own fetch path rather than
+    guessing at a large-enough limit (OpenClaw's review, tranche 3)."""
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM notes WHERE id=?", (note_id,)).fetchone()
+        return dict(row) if row else None
 
 
 # ---------------------------------------------------------------------------
@@ -737,11 +803,36 @@ def get_chat_session(session_id: int) -> dict | None:
         return sess
 
 
-def get_chat_session_messages(session_id: int, after_id: int = 0, limit: int = 50) -> dict | None:
+def get_chat_session_messages(
+    session_id: int, after_id: int = 0, limit: int = 50, before_id: int | None = None,
+) -> dict | None:
     """Paginated transcript fetch. Returns None if the session doesn't exist
     (caller maps that to a 404). Ascending id order is correct and safe to
-    paginate even while an active session is still appending -- new messages
-    only ever get higher ids, so a page already fetched never shifts."""
+    paginate forward even while an active session is still appending -- new
+    messages only ever get higher ids, so a page already fetched never
+    shifts.
+
+    `before_id`, if given, switches to descending pagination (fetching the
+    page just older than `before_id`) instead of the default forward/
+    ascending mode -- mutually exclusive with `after_id`, used to page
+    further back from an around-message window (tranche 3, see
+    get_chat_session_messages_around) without walking from message 1."""
+    if before_id is not None:
+        if before_id < 0:
+            raise ValueError("before_id must be >= 0")
+        limit = max(1, min(limit, 200))
+        with _connect() as conn:
+            if not conn.execute("SELECT id FROM chat_sessions WHERE id=?", (session_id,)).fetchone():
+                return None
+            rows = conn.execute(
+                "SELECT * FROM chat_messages WHERE session_id=? AND id<? ORDER BY id DESC LIMIT ?",
+                (session_id, before_id, limit + 1),
+            ).fetchall()
+            has_more = len(rows) > limit
+            messages = [dict(r) for r in reversed(rows[:limit])]  # re-ascend for consistent rendering order
+            next_before_id = messages[0]["id"] if messages and has_more else None
+            return {"messages": messages, "next_before_id": next_before_id, "has_more": has_more}
+
     if after_id < 0:
         raise ValueError("after_id must be >= 0")
     limit = max(1, min(limit, 200))
@@ -756,6 +847,58 @@ def get_chat_session_messages(session_id: int, after_id: int = 0, limit: int = 5
         messages = [dict(r) for r in rows[:limit]]
         next_after_id = messages[-1]["id"] if messages and has_more else None
         return {"messages": messages, "next_after_id": next_after_id, "has_more": has_more}
+
+
+def get_chat_session_messages_around(
+    session_id: int, message_id: int, before: int = 25, after: int = 25,
+) -> dict | None:
+    """Bounded window centered on `message_id` -- lets a search hit (or any
+    other direct reference to one message) open a transcript AT that message
+    without paging through everything before it. Returns None if the session
+    doesn't exist; raises NotFoundError if message_id doesn't belong to that
+    session (mismatched/malformed message references must be distinguishable
+    from a missing session -- OpenClaw's review, tranche 3).
+
+    before/after are validated, not silently clamped, on the low end -- a
+    negative window size is malformed input (400), not a value to coerce to
+    0 (OpenClaw's live black-box catch: before=-1 was returning 200 with the
+    negative silently treated as zero)."""
+    if before < 0 or after < 0:
+        raise ValueError("before/after must be >= 0")
+    if before > 100 or after > 100:
+        raise ValueError("before/after must be <= 100")
+    with _connect() as conn:
+        if not conn.execute("SELECT id FROM chat_sessions WHERE id=?", (session_id,)).fetchone():
+            return None
+        if not conn.execute(
+            "SELECT id FROM chat_messages WHERE id=? AND session_id=?", (message_id, session_id)
+        ).fetchone():
+            raise NotFoundError(f"message {message_id} not found in session {session_id}")
+
+        before_rows = conn.execute(
+            "SELECT * FROM chat_messages WHERE session_id=? AND id<? ORDER BY id DESC LIMIT ?",
+            (session_id, message_id, before),
+        ).fetchall()
+        after_rows = conn.execute(
+            "SELECT * FROM chat_messages WHERE session_id=? AND id>=? ORDER BY id ASC LIMIT ?",
+            (session_id, message_id, after + 1),
+        ).fetchall()
+
+        before_msgs = [dict(r) for r in reversed(before_rows)]
+        after_msgs = [dict(r) for r in after_rows]
+        all_msgs = before_msgs + after_msgs
+
+        return {
+            "messages": all_msgs,
+            "target_message_id": message_id,
+            "earliest_loaded_id": all_msgs[0]["id"] if all_msgs else None,
+            "latest_loaded_id": all_msgs[-1]["id"] if all_msgs else None,
+            # Exact has_more signals, not heuristics: before/after fetched
+            # exactly `before`/`after+1` rows when a full page exists, so
+            # hitting that count means there's at least one more beyond it.
+            "has_more_before": len(before_rows) == before and before > 0,
+            "has_more_after": len(after_rows) > after,
+        }
 
 
 def export_chat_session(session_id: int, fmt: str = "json") -> dict | None:
@@ -814,6 +957,219 @@ def export_chat_session(session_id: int, fmt: str = "json") -> dict | None:
     }
 
 
+# ---------------------------------------------------------------------------
+# Search (tranche 3)
+# ---------------------------------------------------------------------------
+
+def _search_rowid(source_type: str, source_id: int) -> int:
+    return _SEARCH_TYPE_CODE[source_type] * 10_000_000_000 + source_id
+
+
+def _task_search_content(title: str, description: str, tags_str: str) -> str:
+    """Task indexed text = title + description + space-joined tags (defined
+    explicitly per OpenClaw's review -- tags ARE included)."""
+    tags = ", ".join(t for t in (tags_str or "").split(",") if t)
+    return "\n".join(filter(None, [title, description, tags]))
+
+
+def _index_for_search(
+    conn: sqlite3.Connection, source_type: str, source_id: int, parent_id: int | None,
+    content: str, author: str, created_at: str,
+) -> None:
+    """Delete+reinsert a row's search entry. MUST be called with the SAME
+    `conn` (and therefore the same transaction) as the canonical mutation --
+    a source commit followed by a separate index commit would let the two
+    drift on any partial failure (OpenClaw's review: this is a hard
+    requirement, not a style preference)."""
+    rowid = _search_rowid(source_type, source_id)
+    # Strip the snippet sentinel characters from indexed content -- without
+    # this, a user typing literal \x01/\x02 (control characters, but valid
+    # in a JSON string) would survive esc() unchanged client-side and become
+    # an indistinguishable-from-real <mark> tag. Stripping at index time
+    # means the ONLY \x01/\x02 that can ever appear in a snippet() result are
+    # the ones snippet() itself inserts -- making "only our insertions
+    # become markup" literally true, not just true in practice (OpenClaw's
+    # review, tranche 3 served-UI pass).
+    content = content.replace(SNIPPET_START, "").replace(SNIPPET_END, "")
+    conn.execute("DELETE FROM search_index WHERE rowid=?", (rowid,))
+    conn.execute(
+        "INSERT INTO search_index (rowid, content, source_type, source_id, parent_id, author, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (rowid, content, source_type, source_id, parent_id, author, created_at),
+    )
+
+
+def _rebuild_search_index(conn: sqlite3.Connection) -> int:
+    """Full delete+reindex of everything -- used once on first-ever table
+    creation (backfill) and exposed publicly below as the drift-
+    reconciliation tool (OpenClaw's review: search must cover pre-existing
+    data, and there must be a way to detect/fix drift if it ever happens)."""
+    conn.execute("DELETE FROM search_index")
+    count = 0
+    for row in conn.execute("SELECT * FROM tasks").fetchall():
+        content = _task_search_content(row["title"], row["description"], row["tags"])
+        _index_for_search(conn, "task", row["id"], None, content, row["created_by"], row["updated_at"])
+        count += 1
+    for row in conn.execute("SELECT * FROM comments").fetchall():
+        _index_for_search(conn, "comment", row["id"], row["task_id"], row["text"], row["author"], row["created_at"])
+        count += 1
+    for row in conn.execute("SELECT * FROM notes").fetchall():
+        _index_for_search(conn, "note", row["id"], None, row["text"], row["author"], row["created_at"])
+        count += 1
+    for row in conn.execute("SELECT * FROM chat_messages").fetchall():
+        _index_for_search(conn, "chat_message", row["id"], row["session_id"], row["text"], row["author"], row["created_at"])
+        count += 1
+    return count
+
+
+def rebuild_search_index() -> int:
+    """Public entry point for the drift-reconciliation tool -- safe to call
+    any time (e.g. from a maintenance script or test) since it's a full
+    rebuild, not an incremental patch. Returns the number of rows indexed."""
+    with _connect() as conn:
+        conn.execute("BEGIN")
+        count = _rebuild_search_index(conn)
+        conn.execute("COMMIT")
+        return count
+
+
+# --- Maintenance-only deletion helpers ---------------------------------
+# Deliberately NOT wired into REST/MCP in this tranche -- "can either agent
+# delete arbitrary shared history" is its own product/audit-trail design
+# question (who's allowed, does it emit an event, is it soft or hard) that
+# deserves a real discussion, not a side effect of shipping search. These
+# exist so the one-off cleanup of accumulated acceptance-test debris (search
+# surfaced it -- OpenClaw's review, tranche 3) can be done precisely and
+# repeatably instead of hand-editing the DB file.
+
+def delete_task(task_id: int) -> bool:
+    with _connect() as conn:
+        comment_ids = [r["id"] for r in conn.execute("SELECT id FROM comments WHERE task_id=?", (task_id,)).fetchall()]
+        conn.execute("DELETE FROM task_chat_sessions WHERE task_id=?", (task_id,))
+        conn.execute("DELETE FROM comments WHERE task_id=?", (task_id,))
+        cur = conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+        removed = cur.rowcount > 0
+        if removed:
+            conn.execute("DELETE FROM search_index WHERE rowid=?", (_search_rowid("task", task_id),))
+            for cid in comment_ids:
+                conn.execute("DELETE FROM search_index WHERE rowid=?", (_search_rowid("comment", cid),))
+        return removed
+
+
+def delete_note(note_id: int) -> bool:
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM notes WHERE id=?", (note_id,))
+        removed = cur.rowcount > 0
+        if removed:
+            conn.execute("DELETE FROM search_index WHERE rowid=?", (_search_rowid("note", note_id),))
+        return removed
+
+
+def delete_chat_message(message_id: int) -> bool:
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM chat_messages WHERE id=?", (message_id,))
+        removed = cur.rowcount > 0
+        if removed:
+            conn.execute("DELETE FROM search_index WHERE rowid=?", (_search_rowid("chat_message", message_id),))
+        return removed
+
+
+def _tokenize_for_search(query: str) -> list[str]:
+    return re.findall(r"\w+", query, flags=re.UNICODE)
+
+
+def search(query: str, types: list[str] | None = None, limit: int = 20, offset: int = 0) -> dict:
+    """Unified search across tasks/comments/notes/chat messages. Raises
+    ValueError for any malformed input (REST maps to 400) -- one validation
+    path shared by the REST route and the MCP tool, so they can never drift
+    on what counts as a valid query (OpenClaw's review)."""
+    query = (query or "").strip()
+    if not query:
+        raise ValueError("q must not be empty")
+    if len(query) > SEARCH_MAX_QUERY_LEN:
+        raise ValueError(f"q must be <= {SEARCH_MAX_QUERY_LEN} characters")
+    tokens = _tokenize_for_search(query)
+    if not tokens:
+        raise ValueError("q must contain at least one searchable token")
+    if len(tokens) > SEARCH_MAX_TOKENS:
+        raise ValueError(f"q must contain <= {SEARCH_MAX_TOKENS} tokens")
+    # Rebuilt into a safe, predictable MATCH expression -- the raw query
+    # string never reaches FTS5's query parser, so it can't produce a syntax
+    # error or an unintended operator no matter what punctuation/special
+    # characters the user typed (OpenClaw's review).
+    fts_query = " AND ".join(f'"{t}"*' for t in tokens)
+
+    if types:
+        unknown = [t for t in types if t not in SEARCH_TYPES]
+        if unknown:
+            raise ValueError(f"unknown type(s): {unknown!r}; must be a subset of {SEARCH_TYPES}")
+    else:
+        types = list(SEARCH_TYPES)
+
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+    if limit <= 0:
+        raise ValueError("limit must be > 0")
+    limit = min(limit, SEARCH_MAX_LIMIT)
+
+    with _connect() as conn:
+        placeholders = ",".join("?" * len(types))
+        rows = conn.execute(
+            f"SELECT source_type, source_id, parent_id, author, created_at, "
+            f"snippet(search_index, 0, ?, ?, '...', 12) AS snippet, "
+            f"bm25(search_index) AS rank "
+            f"FROM search_index WHERE search_index MATCH ? AND source_type IN ({placeholders}) "
+            f"ORDER BY rank ASC, created_at DESC, source_type ASC, source_id DESC "
+            f"LIMIT ? OFFSET ?",
+            [SNIPPET_START, SNIPPET_END, fts_query, *types, limit + 1, offset],
+        ).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+
+        # Batched parent-context lookup -- one query per referenced
+        # type/id-set, not one per result (OpenClaw's review: no N+1).
+        task_ids = {r["source_id"] for r in rows if r["source_type"] == "task"}
+        comment_task_ids = {r["parent_id"] for r in rows if r["source_type"] == "comment" and r["parent_id"] is not None}
+        chat_session_ids = {r["parent_id"] for r in rows if r["source_type"] == "chat_message" and r["parent_id"] is not None}
+
+        task_status: dict[int, dict] = {}
+        for tid in task_ids | comment_task_ids:
+            trow = conn.execute("SELECT id, title, status FROM tasks WHERE id=?", (tid,)).fetchone()
+            if trow:
+                task_status[tid] = dict(trow)
+        session_status: dict[int, dict] = {}
+        for sid in chat_session_ids:
+            srow = conn.execute("SELECT id, status FROM chat_sessions WHERE id=?", (sid,)).fetchone()
+            if srow:
+                session_status[sid] = dict(srow)
+
+        results = []
+        for r in rows:
+            d = dict(r)
+            st, sid, pid = d["source_type"], d["source_id"], d["parent_id"]
+            if st == "task":
+                t = task_status.get(sid)
+                context = {"status": t["status"]} if t else {}
+            elif st == "comment":
+                t = task_status.get(pid) if pid is not None else None
+                context = {"task_id": pid, "task_title": t["title"], "task_status": t["status"]} if t else {"task_id": pid}
+            elif st == "chat_message":
+                s = session_status.get(pid) if pid is not None else None
+                context = {"session_id": pid, "session_status": s["status"]} if s else {"session_id": pid}
+            else:
+                context = {}
+            results.append({
+                "source_type": st, "source_id": sid, "parent_id": pid,
+                "author": d["author"], "created_at": d["created_at"],
+                "rank": d["rank"], "snippet": d["snippet"], "context": context,
+            })
+
+        return {
+            "query": query, "types": types, "limit": limit, "offset": offset,
+            "has_more": has_more, "results": results,
+        }
+
+
 def send_chat_message(session_id: int, author: str, text: str) -> dict | None:
     """Append a message. Returns None (no-op) if the session doesn't exist or has
     already ended, so a straggling agent can't resurrect a closed session."""
@@ -830,6 +1186,7 @@ def send_chat_message(session_id: int, author: str, text: str) -> dict | None:
         msg = dict(row)
         _emit_event(conn, "chat_message", {"session_id": session_id, "message_id": msg["id"], "author": author, "text": text})
         _touch_presence(conn, author, "send_chat_message")
+        _index_for_search(conn, "chat_message", msg["id"], session_id, text, author, now)
         return msg
 
 
