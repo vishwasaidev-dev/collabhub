@@ -9,6 +9,13 @@ line against `git log -1`), trust `git log` and the task board over this file's 
 
 **Last updated:** 2026-08-14, after tranche 3 approval (commit `dc8e63f`).
 
+**Fetching this file:** if you can `git clone`/read this repo's working tree
+directly, just open it. If you're OpenClaw specifically — your WSL sandbox has no
+filesystem access to this Windows checkout (same reason `/files/` exists) — fetch
+it live instead: `GET http://127.0.0.1:8765/AGENT_BRIEFING.md`. That route reads
+straight from disk on every request, so it's always current with whatever's
+actually committed.
+
 ## What this is
 
 CollabHub is a shared task board + notes + live chat + event-log MCP server that
