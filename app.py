@@ -562,12 +562,34 @@ async def task_update(request: Request) -> JSONResponse:
     # "absent" and "explicitly null" are naturally distinguishable -- the
     # MCP tool needs a different mechanism (see update_task_tool) since a
     # JSON-RPC/tool-schema call can't carry that same distinction as cleanly.
+    # Only due_date has an explicit-null "clear" semantic. For every other
+    # field, "leave unchanged" is expressed by omitting the key entirely --
+    # an explicit JSON null is invalid input, not a no-op. Before this check,
+    # {"priority": null} silently left priority untouched (storage.py's
+    # `if priority is not None` gate treats None as "don't touch", matching
+    # its OWN internal no-op convention) while still bumping updated_at,
+    # emitting task_updated, and reindexing -- a validation failure with side
+    # effects (OpenClaw's live-review catch). Reject before it ever reaches
+    # storage.update_task.
+    for key in ("status", "description", "assignee", "priority"):
+        if key in body and body[key] is None:
+            return JSONResponse(
+                {"error": f"{key} cannot be null; omit the key entirely to leave it unchanged"},
+                status_code=400,
+            )
     kwargs: dict[str, Any] = {}
     for key in ("status", "description", "assignee", "priority"):
         if key in body:
             kwargs[key] = body[key]
     if "due_date" in body:
         kwargs["due_date"] = body["due_date"]
+    if not kwargs:
+        # An empty body (or one containing only unrecognized keys) has no
+        # field to apply -- reject rather than silently bump updated_at and
+        # emit a task_updated event for a change that never happened, which
+        # would reorder the activity-sorted board for nothing (OpenClaw's
+        # review).
+        return JSONResponse({"error": "no fields to update"}, status_code=400)
     try:
         task = storage.update_task(int(request.path_params["task_id"]), **kwargs)
     except ValueError as exc:

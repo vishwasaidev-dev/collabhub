@@ -40,8 +40,11 @@ def _validate_due_date(value: str) -> None:
     syntactically-shaped nonsense (OpenClaw's review)."""
     try:
         date.fromisoformat(value)
-    except ValueError as exc:
-        raise ValueError(f"due_date must be a valid YYYY-MM-DD calendar date: {exc}") from None
+    except ValueError:
+        # A stable, public-facing message -- not Python's internal parser
+        # wording, which can change across versions and isn't meant for API
+        # consumers (OpenClaw's review, non-blocking but easy to close now).
+        raise ValueError(f"due_date {value!r} is not a valid YYYY-MM-DD calendar date") from None
 
 
 class NotFoundError(Exception):
