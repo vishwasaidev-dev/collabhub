@@ -7,7 +7,7 @@ project, **read this file top to bottom before doing anything else.** It's kept
 up to date at the end of every tranche — if it looks stale (check the "Last updated"
 line against `git log -1`), trust `git log` and the task board over this file's prose.
 
-**Last updated:** 2026-08-14, after tranche 4 Part A shipped (commit `8e32733`, awaiting review).
+**Last updated:** 2026-08-14, after tranche 4 (Parts A+B) formally approved (commit `b27bd33`).
 
 **Fetching this file:** if you can `git clone`/read this repo's working tree
 directly, just open it. If you're OpenClaw specifically — your WSL sandbox has no
@@ -91,18 +91,27 @@ no access to this particular one. Use the OpenClaw-specific alternatives first:
 | Tranche 1 | Live dashboard driven by the SSE feed (Live/Reconnecting/Polling indicator, presence panel, "N new" badges) | **APPROVED** (task #8, 5 review passes) | `9a9c15c` → `cd00624` |
 | Tranche 2 | Browsable chat history, deep-linkable transcript drawer (`?session=N`), many-to-many task↔chat-session linkage | **APPROVED** (task #17, 3 rounds / 13 issues) | `56790c8` → `f19c587` |
 | Tranche 3 | Full-text search (FTS5) across tasks/comments/notes/chat, around-message navigation (`?session=N&message=M`) | **APPROVED** (task #20, 2 rounds / 10 issues) | `dc8e63f` |
-| Tranche 4 Part A | Task priority/due-date/checklist (schema, tri-state due_date, checklist CRUD, inline checklist UI) | Shipped, **awaiting OpenClaw review** (task #24) | `8e32733` |
+| Tranche 4 | Task priority/due-date/checklist (Part A) **+** collapsible dashboard sections (Part B) | **APPROVED** (task #24, 6 review rounds — see below) | `8e32733` → `b27bd33` |
+
+Tranche 4 was an unusually dense review cycle, worth knowing about if you're
+about to touch this code: 6 rounds on task #24 (comments 52/54/56/57/58/59),
+every one finding a real, distinct bug — including one round that was OpenClaw
+re-reviewing its OWN previously-suggested fix for the chat-collapse scroll
+behavior and finding that fix still had a gap (`chatAtBottom` only updated on
+render, not on a bare user scroll with no render in between). If you're
+extending the checklist or collapsible-section code, read task #24's full
+comment thread first — the specific traps hit there (`aria-disabled` vs.
+`disabled` for focus-preservable busy states, `[hidden]` losing to an
+element's own `display` CSS rule, `stopPropagation()` in a document-level
+listener being too late to stop an ancestor's own bubble-phase listener) are
+exactly the kind of thing that's easy to reintroduce by analogy in new code.
 
 ## What's still open
 
-- **Tranche 4 Part B**: user-requested UI feature (2026-08-14, no rush) — make
-  dashboard sections collapsible: board columns and the sidebar panels
-  (Presence/Shared notes/Chat history/Live chat), state persisted client-side
-  across reloads. Contract already reviewed (task #24 comment 52); not yet
-  implemented as of this writing.
 - **Tranche 5**: file attachments on tasks/comments. Deliberately last — real
   security-surface questions (path traversal, size/MIME limits, storage location)
-  that deserve their own careful design pass, not a bolt-on.
+  that deserve their own careful design pass, not a bolt-on. Design contract
+  not yet posted as of this writing.
 
 ## Known gotchas — don't waste a review cycle rediscovering these
 
@@ -147,6 +156,32 @@ no access to this particular one. Use the OpenClaw-specific alternatives first:
   tests at a disposable DB (`storage.DB_PATH` is a plain module attribute,
   easily monkeypatched — see `tests/test_invite_transaction.py` and
   `tests/test_search_index.py` for the pattern).
+- **`disabled` vs `aria-disabled` for a "busy while a request is in flight"
+  control.** The native `disabled` attribute makes an element genuinely
+  unfocusable — if you then try to restore keyboard focus to that same
+  control (e.g. after a re-render), the browser silently refuses and focus
+  falls to `<body>`. Use `aria-disabled="true"` instead (stays focusable) plus
+  a JS guard in the event handler that ignores/reverts a duplicate activation
+  attempt while busy. This exact bug broke tranche 4's checklist
+  focus-preservation on first ship (task #24 comment 56).
+- **`[hidden]` can lose to an element's own `display` CSS rule.**
+  `[hidden]{display:none}` is a browser default (user-agent stylesheet);
+  *any* author rule that sets `display` on that same element (e.g.
+  `.chat-log{display:flex}`) overrides it regardless of selector specificity,
+  because author styles always beat UA styles. If a collapsible target ever
+  stops actually hiding despite `hidden` being set and `aria-expanded` saying
+  otherwise, this is almost certainly why. Tranche 4 fixed it project-wide
+  with one `[hidden]{display:none !important;}` rule rather than patching the
+  one collision that happened to surface (task #24 comment 57 follow-up).
+- **`stopPropagation()` on a `document`-level delegated listener cannot stop
+  an ancestor element's OWN listener from firing first.** Bubble-phase
+  listeners fire in the order they're encountered walking UP the tree from
+  the event target — a listener bound directly to a `<h2>` fires before the
+  event ever reaches a `document`-level listener, so calling
+  `stopPropagation()` in the latter is structurally too late to prevent the
+  former. If you need to suppress an ancestor's own handler, that ancestor's
+  handler itself has to check the event target (`e.target.closest(...)`),
+  not a listener further up the tree (task #24 comment 57).
 
 ## Where the durable disaster-recovery info lives
 
