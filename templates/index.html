@@ -324,15 +324,42 @@ async function fetchPresence() {
   } catch { /* independent of SSE health; just skip this tick */ }
 }
 
+// True once the very first resync (the initial page load) has completed.
+// Guards the badge-diffing below -- the initial load must not count
+// everything already on the board as "new".
+let hasLoadedOnce = false;
+
 // Full atomic resync -- used for the very first load, and again whenever the
 // stream recovers from an outage, so anything missed during a gap gets
 // reconciled rather than silently staying stale (review point 5/8).
+//
+// Badge semantics must hold here too, not just on the live-event path: data
+// that arrived while SSE was down (polling fallback) or that a recovery
+// resync jumped over would otherwise show up on the board with 0 "new"
+// count, silently violating "N new since page load" (OpenClaw's review,
+// 2026-08-14). Fixed by diffing the OLD in-memory maps against the freshly
+// fetched ones before overwriting: anything not already present (or, for
+// tasks, present with a different updated_at) counts as new. Diffing against
+// the current maps -- which already reflect anything the live-event path
+// already counted -- means nothing already-live-applied gets double-counted.
 async function fullResync() {
   const res = await fetch("/api/state", { cache: "no-store" });
   const data = await res.json();
 
-  tasksById = new Map((data.tasks || []).map(t => [t.id, t]));
-  notesById = new Map((data.notes || []).map(n => [n.id, n]));
+  const newTasksById = new Map((data.tasks || []).map(t => [t.id, t]));
+  const newNotesById = new Map((data.notes || []).map(n => [n.id, n]));
+
+  if (hasLoadedOnce) {
+    for (const [id, t] of newTasksById) {
+      const old = tasksById.get(id);
+      if (!old || old.updated_at !== t.updated_at) newCounts.tasks++;
+    }
+    for (const [id] of newNotesById) {
+      if (!notesById.has(id)) newCounts.notes++;
+    }
+  }
+  tasksById = newTasksById;
+  notesById = newNotesById;
   for (const p of data.presence || []) presenceByAgent.set(p.agent, p);
   activeSession = data.latest_chat_session || null;
 
@@ -340,12 +367,19 @@ async function fullResync() {
     try {
       const res2 = await fetch(`/api/chat/poll?session_id=${activeSession.id}&since=0`, { cache: "no-store" });
       const chatData = await res2.json();
-      chatMessagesById = new Map((chatData.messages || []).map(m => [m.id, m]));
+      const newChatById = new Map((chatData.messages || []).map(m => [m.id, m]));
+      if (hasLoadedOnce) {
+        for (const [id] of newChatById) {
+          if (!chatMessagesById.has(id)) newCounts.chat++;
+        }
+      }
+      chatMessagesById = newChatById;
     } catch { /* chat panel just stays with whatever it had */ }
   } else {
     chatMessagesById = new Map();
   }
 
+  hasLoadedOnce = true;
   renderBoard(); renderNotes(); renderChat(); renderPresence();
   return data.event_cursor || 0;
 }
