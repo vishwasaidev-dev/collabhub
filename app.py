@@ -28,7 +28,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -145,6 +145,57 @@ def list_chat_sessions_tool(limit: int = 20) -> list[dict]:
     return storage.list_chat_sessions(limit)
 
 
+@mcp.tool(name="list_chat_session_history", description=(
+    "Cursor-paginated session index (active session pinned first on page 1). Pass the "
+    "previous response's next_cursor to fetch the next page; has_more tells you when to "
+    "stop. Each session includes message_count, duration_seconds (null while active), "
+    "and linked_tasks."
+))
+def list_chat_session_history_tool(cursor: int | None = None, limit: int = 20) -> dict:
+    return storage.list_chat_sessions_paginated(cursor, limit)
+
+
+@mcp.tool(name="get_chat_session", description=(
+    "Single-session detail: status, duration_seconds (null while active), linked_tasks, "
+    "message_count. Returns null if the session doesn't exist."
+))
+def get_chat_session_tool(session_id: int) -> dict | None:
+    return storage.get_chat_session(session_id)
+
+
+@mcp.tool(name="get_chat_session_messages", description=(
+    "Paginated transcript for one session, oldest first. Pass the previous response's "
+    "next_after_id as after_id to fetch the next page. Returns null if the session doesn't exist."
+))
+def get_chat_session_messages_tool(session_id: int, after_id: int = 0, limit: int = 50) -> dict | None:
+    return storage.get_chat_session_messages(session_id, after_id, limit)
+
+
+@mcp.tool(name="link_task_session", description=(
+    "Link a task to a chat session with a relation_type (lowercase token, e.g. 'discussion' "
+    "or 'related' -- 'invite' is reserved, created automatically by start_chat_session). "
+    "Idempotent -- linking the same pair twice is a no-op, not an error."
+))
+def link_task_session_tool(task_id: int, session_id: int, relation_type: str, linked_by: str = "") -> dict:
+    return storage.link_task_session(task_id, session_id, relation_type, linked_by)
+
+
+@mcp.tool(name="unlink_task_session", description=(
+    "Remove a task<->session link. The 'invite' relation can't be removed this way -- it's "
+    "lifecycle-owned by the session. Returns whether a link was actually removed."
+))
+def unlink_task_session_tool(task_id: int, session_id: int, relation_type: str) -> bool:
+    return storage.unlink_task_session(task_id, session_id, relation_type)
+
+
+@mcp.tool(name="export_chat_session", description=(
+    "Export a session's full transcript + metadata as a consistent snapshot. format is "
+    "'json' or 'markdown'. Returns null if the session doesn't exist."
+))
+def export_chat_session_tool(session_id: int, format: str = "json") -> dict | None:
+    return storage.export_chat_session(session_id, format)
+
+
 @mcp.tool(name="send_chat_message", description=(
     "Send one message in an active chat session. Identify yourself as author "
     "('claude' or 'openclaw'). No-ops (returns null) if the session has already ended."
@@ -232,7 +283,10 @@ async def chat_start(request: Request) -> JSONResponse:
     raw = await request.body()
     if raw:
         body = await request.json()
-    return JSONResponse(storage.start_chat_session(body.get("started_by", ""), body.get("invite_task_id")))
+    try:
+        return JSONResponse(storage.start_chat_session(body.get("started_by", ""), body.get("invite_task_id")))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 async def chat_end(request: Request) -> JSONResponse:
@@ -260,8 +314,69 @@ async def chat_poll(request: Request) -> JSONResponse:
 
 
 async def chat_sessions_list(request: Request) -> JSONResponse:
+    """Tranche-2 history index -- cursor-paginated, active pinned first on
+    page 1. Superseded the old plain LIMIT listing (kept server-side as
+    storage.list_chat_sessions for the legacy MCP tool only)."""
+    cursor_param = request.query_params.get("cursor")
+    cursor = int(cursor_param) if cursor_param is not None else None
     limit = int(request.query_params.get("limit", 20))
-    return JSONResponse(storage.list_chat_sessions(limit))
+    return JSONResponse(storage.list_chat_sessions_paginated(cursor, limit))
+
+
+async def chat_session_detail(request: Request) -> JSONResponse:
+    session_id = int(request.path_params["session_id"])
+    result = storage.get_chat_session(session_id)
+    if result is None:
+        return JSONResponse({"error": "session not found"}, status_code=404)
+    return JSONResponse(result)
+
+
+async def chat_session_messages(request: Request) -> JSONResponse:
+    session_id = int(request.path_params["session_id"])
+    after_id = int(request.query_params.get("after_id", 0))
+    limit = int(request.query_params.get("limit", 50))
+    try:
+        result = storage.get_chat_session_messages(session_id, after_id, limit)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    if result is None:
+        return JSONResponse({"error": "session not found"}, status_code=404)
+    return JSONResponse(result)
+
+
+async def chat_session_export(request: Request) -> Response:
+    session_id = int(request.path_params["session_id"])
+    fmt = request.query_params.get("format", "json")
+    if fmt not in ("json", "markdown"):
+        return JSONResponse({"error": "format must be 'json' or 'markdown'"}, status_code=400)
+    result = storage.export_chat_session(session_id, fmt)
+    if result is None:
+        return JSONResponse({"error": "session not found"}, status_code=404)
+    return Response(
+        result["body"], media_type=result["content_type"],
+        headers={"Content-Disposition": f'attachment; filename="{result["filename"]}"'},
+    )
+
+
+async def task_link_session(request: Request) -> JSONResponse:
+    task_id = int(request.path_params["task_id"])
+    body = await request.json()
+    try:
+        return JSONResponse(storage.link_task_session(
+            task_id, int(body["session_id"]), body.get("relation_type", ""), body.get("linked_by", "")
+        ))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+async def task_unlink_session(request: Request) -> JSONResponse:
+    task_id = int(request.path_params["task_id"])
+    body = await request.json()
+    try:
+        removed = storage.unlink_task_session(task_id, int(body["session_id"]), body.get("relation_type", ""))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse({"removed": removed})
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +563,9 @@ def build_app() -> Starlette:
             Route("/api/chat/send", chat_send, methods=["POST"]),
             Route("/api/chat/poll", chat_poll),
             Route("/api/chat/sessions", chat_sessions_list),
+            Route("/api/chat/sessions/{session_id:int}/messages", chat_session_messages),
+            Route("/api/chat/sessions/{session_id:int}/export", chat_session_export),
+            Route("/api/chat/sessions/{session_id:int}", chat_session_detail),
             Route("/api/tasks", tasks_list),
             Route("/api/tasks", tasks_create, methods=["POST"]),
             Route("/api/tasks/{task_id:int}", task_get),
@@ -455,6 +573,8 @@ def build_app() -> Starlette:
             Route("/api/tasks/{task_id:int}/claim", task_claim, methods=["POST"]),
             Route("/api/tasks/{task_id:int}/comment", task_comment, methods=["POST"]),
             Route("/api/tasks/{task_id:int}/complete", task_complete, methods=["POST"]),
+            Route("/api/tasks/{task_id:int}/link", task_link_session, methods=["POST"]),
+            Route("/api/tasks/{task_id:int}/unlink", task_unlink_session, methods=["POST"]),
             Route("/api/notes", notes_list),
             Route("/api/notes", notes_post, methods=["POST"]),
             Route("/api/catchup", catch_up_endpoint, methods=["GET", "POST"]),

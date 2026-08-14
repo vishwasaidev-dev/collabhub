@@ -126,6 +126,55 @@
   .msg.claude .head b { color: var(--accent); }
   .msg.openclaw .head b { color: var(--claimed); }
   .msg.openclaw .bubble { border-color: color-mix(in srgb, var(--claimed) 40%, var(--border)); }
+
+  .history-row {
+    display: flex; align-items: center; gap: 8px; padding: 8px 6px; border-radius: 8px;
+    font-size: 12.5px; cursor: pointer; border: 1px solid transparent;
+  }
+  .history-row:hover { background: var(--bg); border-color: var(--border); }
+  .history-row:not(:last-child) { margin-bottom: 2px; }
+  .history-row .hid { color: var(--muted); flex: none; width: 28px; }
+  .history-row .htitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .history-row .hmeta { color: var(--muted); font-size: 11px; flex: none; }
+  .loadmore {
+    display: block; width: 100%; margin-top: 8px; padding: 6px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text);
+    font-size: 12px; cursor: pointer;
+  }
+  .loadmore:hover { background: var(--bg); }
+  .link-chip {
+    display: inline-block; font-size: 10.5px; padding: 1px 7px; border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent);
+    margin-right: 4px;
+  }
+
+  .drawer-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 20;
+  }
+  .drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 92vw);
+    background: var(--panel); border-left: 1px solid var(--border);
+    box-shadow: -8px 0 24px rgba(0,0,0,.15); z-index: 21;
+    display: flex; flex-direction: column;
+  }
+  .drawer-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 16px; border-bottom: 1px solid var(--border);
+  }
+  .drawer-head h2 { font-size: 15px; margin: 0; }
+  .drawer-actions { display: flex; align-items: center; gap: 10px; }
+  .drawer-link { font-size: 12px; color: var(--accent); text-decoration: none; }
+  .drawer-link:hover { text-decoration: underline; }
+  .drawer-close {
+    background: none; border: none; font-size: 20px; line-height: 1; color: var(--muted);
+    cursor: pointer; padding: 2px 6px; border-radius: 6px;
+  }
+  .drawer-close:hover { background: var(--bg); color: var(--text); }
+  .drawer-meta {
+    padding: 8px 16px; font-size: 11.5px; color: var(--muted); border-bottom: 1px solid var(--border);
+  }
+  .drawer-body { flex: 1; overflow-y: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }
+  .drawer-error { color: var(--blocked); font-size: 13px; padding: 12px 2px; }
 </style>
 </head>
 <body>
@@ -152,8 +201,27 @@
       <h2 class="clickable" id="chatHeader">Live chat <span class="chat-status" id="chatStatus"></span> <span class="newcount" id="chatNew" style="display:none;"></span></h2>
       <div class="chat-log" id="chatLog"></div>
     </div>
+    <div class="panel" id="historyPanel">
+      <h2>Chat history</h2>
+      <div id="historyList"></div>
+      <button class="loadmore" id="historyLoadMore" style="display:none;">Load more</button>
+    </div>
   </div>
 </main>
+<div class="drawer-backdrop" id="drawerBackdrop" style="display:none;"></div>
+<div class="drawer" id="transcriptDrawer" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="transcriptTitle">
+  <div class="drawer-head">
+    <h2 id="transcriptTitle">Session</h2>
+    <div class="drawer-actions">
+      <a id="transcriptExportJson" class="drawer-link" href="#">Export JSON</a>
+      <a id="transcriptExportMd" class="drawer-link" href="#">Export Markdown</a>
+      <button id="transcriptClose" class="drawer-close" aria-label="Close transcript" tabindex="0">&times;</button>
+    </div>
+  </div>
+  <div class="drawer-meta" id="transcriptMeta"></div>
+  <div class="drawer-body" id="transcriptBody"></div>
+  <button class="loadmore" id="transcriptLoadMore" style="display:none;">Load more</button>
+</div>
 <script>
 const COLUMNS = [
   ["open", "Open"],
@@ -487,12 +555,23 @@ async function applyEvent(evt) {
         if (isNew) newCounts.chat++;
         renderChat();
       }
+      // Live-tail into an open transcript drawer too, if it's showing this
+      // same session -- a history view of the active session shouldn't need
+      // its own separate poll loop when the event log already has it.
+      if (viewingSessionId === evt.payload.session_id) {
+        viewingMessages.set(evt.payload.message_id, {
+          id: evt.payload.message_id, session_id: evt.payload.session_id,
+          author: evt.payload.author, text: evt.payload.text, created_at: evt.created_at,
+        });
+        renderTranscript();
+      }
       break;
     }
     case "chat_session_started": {
-      activeSession = { id: evt.payload.session_id, status: "active", started_by: evt.payload.started_by };
+      activeSession = { id: evt.payload.session_id, status: "active", started_by: evt.payload.started_by, linked_tasks: [] };
       chatMessagesById = new Map();
       renderChat();
+      refreshHistoryList();
       break;
     }
     case "chat_session_ended": {
@@ -500,6 +579,13 @@ async function applyEvent(evt) {
         activeSession = { ...activeSession, status: "ended" };
         renderChat();
       }
+      // An open transcript for the session that just ended should reflect
+      // the new status/duration immediately, not just next time it's
+      // reopened (idempotent -- re-applying the same ended state is a no-op).
+      if (viewingSessionId === evt.payload.session_id) {
+        fetchSessionMeta(evt.payload.session_id).catch(() => {});
+      }
+      refreshHistoryList();
       break;
     }
   }
@@ -602,10 +688,201 @@ document.getElementById("boardHeader").addEventListener("click", () => { newCoun
 document.getElementById("notesHeader").addEventListener("click", () => { newCounts.notes = 0; renderNewCount("notes"); });
 document.getElementById("chatHeader").addEventListener("click", () => { newCounts.chat = 0; renderNewCount("chat"); });
 
+// ---------------------------------------------------------------------------
+// Chat history (tranche 2): session list + deep-linkable transcript drawer.
+// The active session is pinned server-side in addition to the page limit
+// (not counted against it) -- a deliberate reading of "pinned first" as
+// "always visible", flagged explicitly for review rather than assumed.
+// ---------------------------------------------------------------------------
+let historySessions = [];
+let historyCursor = null;
+let historyHasMore = false;
+
+let viewingSessionId = null;   // session id currently open in the drawer, or null
+let viewingSessionMeta = null;
+let viewingMessages = new Map();
+let viewingNextAfterId = 0;
+let viewingHasMore = false;
+
+function fmtDuration(seconds) {
+  if (seconds == null) return "ongoing";
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60), s = seconds % 60;
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+function linkChips(linkedTasks) {
+  if (!linkedTasks || !linkedTasks.length) return "";
+  return linkedTasks.map(t => `<span class="link-chip">#${t.task_id} ${esc(t.relation_type)}</span>`).join("");
+}
+
+async function fetchHistoryPage(cursor) {
+  const qs = cursor != null ? `?cursor=${cursor}&limit=15` : `?limit=15`;
+  const res = await fetch(`/api/chat/sessions${qs}`, { cache: "no-store" });
+  return res.json();
+}
+
+async function refreshHistoryList() {
+  const data = await fetchHistoryPage(null).catch(() => null);
+  if (!data) return;
+  historySessions = data.sessions;
+  historyCursor = data.next_cursor;
+  historyHasMore = data.has_more;
+  renderHistoryList();
+}
+
+async function loadMoreHistory() {
+  if (!historyHasMore) return;
+  const data = await fetchHistoryPage(historyCursor).catch(() => null);
+  if (!data) return;
+  const seen = new Set(historySessions.map(s => s.id));
+  for (const s of data.sessions) if (!seen.has(s.id)) historySessions.push(s); // de-dupe any page-boundary overlap
+  historyCursor = data.next_cursor;
+  historyHasMore = data.has_more;
+  renderHistoryList();
+}
+
+function renderHistoryList() {
+  const el = document.getElementById("historyList");
+  el.innerHTML = historySessions.length
+    ? historySessions.map(s => `
+        <div class="history-row" data-session-id="${s.id}">
+          <span class="hid">#${s.id}</span>
+          <span class="htitle">${esc(s.status)} &middot; started by ${esc(s.started_by || "?")} ${linkChips(s.linked_tasks)}</span>
+          <span class="hmeta">${s.message_count} msg &middot; ${fmtDuration(s.duration_seconds)}</span>
+        </div>`).join("")
+    : `<div class="empty">no sessions yet</div>`;
+  for (const row of el.querySelectorAll(".history-row")) {
+    row.addEventListener("click", () => openTranscript(parseInt(row.dataset.sessionId, 10)));
+  }
+  document.getElementById("historyLoadMore").style.display = historyHasMore ? "" : "none";
+}
+
+async function fetchSessionMeta(sessionId) {
+  const res = await fetch(`/api/chat/sessions/${sessionId}`, { cache: "no-store" });
+  if (!res.ok) throw new Error("session fetch failed: " + res.status);
+  const data = await res.json();
+  if (viewingSessionId === sessionId) {
+    viewingSessionMeta = data;
+    renderTranscript();
+  }
+  return data;
+}
+
+async function openTranscript(sessionId, push = true) {
+  viewingSessionId = sessionId;
+  viewingSessionMeta = null;
+  viewingMessages = new Map();
+  viewingNextAfterId = 0;
+  viewingHasMore = false;
+
+  document.getElementById("drawerBackdrop").style.display = "";
+  document.getElementById("transcriptDrawer").style.display = "flex";
+  document.getElementById("transcriptTitle").textContent = `Session #${sessionId}`;
+  document.getElementById("transcriptMeta").textContent = "";
+  document.getElementById("transcriptBody").innerHTML = `<div class="empty">Loading&hellip;</div>`;
+  document.getElementById("transcriptExportJson").href = `/api/chat/sessions/${sessionId}/export?format=json`;
+  document.getElementById("transcriptExportMd").href = `/api/chat/sessions/${sessionId}/export?format=markdown`;
+
+  if (push) history.pushState({ session: sessionId }, "", "?session=" + sessionId);
+
+  try {
+    await fetchSessionMeta(sessionId);
+  } catch {
+    // Recoverable error state, not a crash -- covers both an unknown session
+    // id typed/linked directly and a transient fetch failure (OpenClaw's
+    // review, point 9).
+    if (viewingSessionId === sessionId) {
+      document.getElementById("transcriptBody").innerHTML =
+        `<div class="drawer-error">Session #${sessionId} not found or couldn't be loaded.</div>`;
+    }
+    return;
+  }
+  await loadMoreTranscript();
+}
+
+async function loadMoreTranscript() {
+  if (viewingSessionId == null) return;
+  const sessionId = viewingSessionId;
+  let data;
+  try {
+    const res = await fetch(
+      `/api/chat/sessions/${sessionId}/messages?after_id=${viewingNextAfterId || 0}&limit=50`,
+      { cache: "no-store" },
+    );
+    if (!res.ok) throw new Error("fetch failed: " + res.status);
+    data = await res.json();
+  } catch {
+    if (viewingSessionId === sessionId && viewingMessages.size === 0) {
+      document.getElementById("transcriptBody").innerHTML = `<div class="drawer-error">Could not load transcript.</div>`;
+    }
+    return;
+  }
+  if (viewingSessionId !== sessionId) return; // drawer moved on to a different session while this was in flight
+  for (const m of data.messages) viewingMessages.set(m.id, m); // id-keyed -- exact ordering, no duplicates across pages
+  viewingHasMore = data.has_more;
+  viewingNextAfterId = data.next_after_id != null ? data.next_after_id : viewingNextAfterId;
+  renderTranscript();
+}
+
+function renderTranscript() {
+  if (viewingSessionId == null) return;
+  const meta = viewingSessionMeta;
+  if (meta) {
+    document.getElementById("transcriptTitle").textContent = `Session #${meta.id}`;
+    document.getElementById("transcriptMeta").innerHTML =
+      `${esc(meta.status)} &middot; started by ${esc(meta.started_by || "?")} &middot; ${fmtTime(meta.started_at)}` +
+      (meta.ended_at ? ` &middot; ended ${fmtTime(meta.ended_at)} (${fmtDuration(meta.duration_seconds)})` : " &middot; ongoing") +
+      (meta.linked_tasks && meta.linked_tasks.length ? `<br>${linkChips(meta.linked_tasks)}` : "");
+  }
+  const msgs = [...viewingMessages.values()].sort((a, b) => a.id - b.id);
+  const body = document.getElementById("transcriptBody");
+  body.innerHTML = msgs.length
+    ? msgs.map(m => `
+        <div class="msg ${esc(m.author)}">
+          <div class="head"><b>${esc(m.author || "?")}</b> &middot; <time>${fmtTime(m.created_at)}</time></div>
+          <div class="bubble">${esc(m.text)}</div>
+        </div>`).join("")
+    : `<div class="empty">no messages</div>`;
+  document.getElementById("transcriptLoadMore").style.display = viewingHasMore ? "" : "none";
+}
+
+function closeTranscript(push = true) {
+  viewingSessionId = null;
+  viewingSessionMeta = null;
+  viewingMessages = new Map();
+  document.getElementById("drawerBackdrop").style.display = "none";
+  document.getElementById("transcriptDrawer").style.display = "none";
+  if (push) history.pushState(null, "", location.pathname);
+}
+
+document.getElementById("historyLoadMore").addEventListener("click", loadMoreHistory);
+document.getElementById("transcriptLoadMore").addEventListener("click", loadMoreTranscript);
+document.getElementById("transcriptClose").addEventListener("click", () => closeTranscript(true));
+document.getElementById("drawerBackdrop").addEventListener("click", () => closeTranscript(true));
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && viewingSessionId != null) closeTranscript(true); });
+
+// Deep link: ?session=N opens on load. Browser back/forward already changed
+// the URL by the time popstate fires, so this only reacts to it -- pushing
+// another history entry here would create a broken back-button loop
+// (OpenClaw's review, point 9).
+window.addEventListener("popstate", () => {
+  const sid = new URLSearchParams(location.search).get("session");
+  if (sid) openTranscript(parseInt(sid, 10), false);
+  else closeTranscript(false);
+});
+
 connectSSE();
 fetchPresence();
 setInterval(fetchPresence, 15000);
 setInterval(renderPresence, 5000);
+refreshHistoryList();
+{
+  const deepLinkSession = new URLSearchParams(location.search).get("session");
+  if (deepLinkSession) openTranscript(parseInt(deepLinkSession, 10), false);
+}
 </script>
 </body>
 </html>
