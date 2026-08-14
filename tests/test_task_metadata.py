@@ -135,6 +135,133 @@ def test_checklist_activity_bumps_task_updated_at() -> None:
     print("PASS: checklist activity bumps task.updated_at")
 
 
+def test_migration_from_legacy_schema_backfills_priority_and_due_date() -> None:
+    """Simulates a DB that predates tranche 4 -- a `tasks` table with no
+    priority/due_date columns at all -- and confirms init_db()'s
+    _ensure_column migration adds them without losing existing rows, with
+    priority backfilling to the CHECK-enforced default."""
+    import sqlite3
+
+    tmp = Path(tempfile.mkstemp(suffix=".sqlite3")[1])
+    conn = sqlite3.connect(tmp)
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            assignee TEXT,
+            created_by TEXT NOT NULL DEFAULT '',
+            tags TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO tasks (title, created_by, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        ("pre-existing legacy task", "claude", "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    storage.DB_PATH = tmp
+    storage.init_db()  # must not raise, must not touch the existing row's identity
+
+    legacy = storage.list_tasks()
+    assert len(legacy) == 1, "the pre-existing row must survive the migration"
+    assert legacy[0]["title"] == "pre-existing legacy task"
+    assert legacy[0]["priority"] == "normal", "existing rows must backfill to the column default"
+    assert legacy[0]["due_date"] is None
+    assert legacy[0]["checklist_items"] == []
+
+    # And the migrated table must still actually enforce the CHECK -- not
+    # just carry the column with no constraint.
+    try:
+        storage.create_task(title="x", priority="not-a-real-priority")
+        raise AssertionError("expected ValueError on a migrated table too")
+    except ValueError:
+        pass
+
+    # Running init_db() again (e.g. a process restart against the now-migrated
+    # DB) must be a no-op, not a second ALTER TABLE attempt.
+    storage.init_db()
+    print("PASS: legacy schema migrates cleanly, backfills to defaults, keeps existing rows, restart-safe")
+
+
+def test_checklist_items_cascade_delete_with_their_task() -> None:
+    """delete_task() does not explicitly DELETE FROM task_checklist_items --
+    it relies entirely on the schema's ON DELETE CASCADE foreign key, which
+    only actually fires if PRAGMA foreign_keys=ON is truly active on the
+    deleting connection. Verified directly against the table, not just
+    through the public API that would also look clean if rows were merely
+    orphaned rather than removed."""
+    _fresh_db()
+    t = storage.create_task(title="x")
+    other = storage.create_task(title="y")  # a sibling row that must NOT be touched
+    for i in range(5):
+        storage.add_checklist_item(t["id"], f"item {i}")
+    storage.add_checklist_item(other["id"], "unrelated item")
+
+    with storage._connect() as conn:
+        count_before = conn.execute(
+            "SELECT COUNT(*) AS c FROM task_checklist_items WHERE task_id=?", (t["id"],)
+        ).fetchone()["c"]
+    assert count_before == 5
+
+    assert storage.delete_task(t["id"]) is True
+
+    with storage._connect() as conn:
+        orphaned = conn.execute(
+            "SELECT COUNT(*) AS c FROM task_checklist_items WHERE task_id=?", (t["id"],)
+        ).fetchone()["c"]
+        other_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM task_checklist_items WHERE task_id=?", (other["id"],)
+        ).fetchone()["c"]
+    assert orphaned == 0, "ON DELETE CASCADE must remove the deleted task's checklist items, not just orphan them"
+    assert other_count == 1, "a sibling task's checklist items must be untouched"
+    print("PASS: checklist items cascade-delete with their task; unrelated tasks unaffected")
+
+
+def test_concurrent_checklist_append_no_lost_writes() -> None:
+    """20 threads each add one checklist item to the SAME task concurrently
+    (separate connections, WAL mode). Since there is deliberately no
+    `position` column to race on (id order is used instead, per the
+    contract), the only correctness property that matters here is that
+    every write actually lands -- no lost updates, no duplicate ids, no
+    exceptions swallowed by a thread."""
+    import threading
+
+    _fresh_db()
+    t = storage.create_task(title="x")
+    n = 20
+    errors: list[Exception] = []
+    lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        try:
+            storage.add_checklist_item(t["id"], f"concurrent item {i}")
+        except Exception as exc:  # noqa: BLE001 -- captured for the assertion below, not swallowed
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    assert not errors, f"concurrent add_checklist_item calls raised: {errors}"
+    final = storage.get_task(t["id"])
+    assert final["checklist_progress"]["total"] == n, (
+        f"expected all {n} concurrent appends to land, got {final['checklist_progress']['total']}"
+    )
+    ids = [item["id"] for item in final["checklist_items"]]
+    assert len(ids) == len(set(ids)), "expected no duplicate ids under concurrent AUTOINCREMENT inserts"
+    print(f"PASS: {n} concurrent checklist appends to the same task all landed, no lost writes or duplicate ids")
+
+
 def test_checklist_hydration_is_consistent_across_task_shapes() -> None:
     """The exact gap OpenClaw's review flagged: initial load (list_tasks/
     full_state) must show the same checklist_items/progress shape as a
@@ -161,5 +288,8 @@ if __name__ == "__main__":
     test_checklist_crud_and_membership()
     test_checklist_max_items_boundary()
     test_checklist_activity_bumps_task_updated_at()
+    test_migration_from_legacy_schema_backfills_priority_and_due_date()
+    test_checklist_items_cascade_delete_with_their_task()
+    test_concurrent_checklist_append_no_lost_writes()
     test_checklist_hydration_is_consistent_across_task_shapes()
     print("All task-metadata tests passed.")
