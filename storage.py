@@ -22,6 +22,15 @@ DB_PATH = Path(__file__).resolve().parent / "collabhub.sqlite3"
 
 VALID_STATUSES = ("open", "claimed", "in_progress", "blocked", "done")
 
+
+class NotFoundError(Exception):
+    """A referenced resource (task, chat session, ...) doesn't exist -- kept
+    distinct from ValueError (malformed input) so REST handlers can map this
+    to 404 instead of 400 (OpenClaw's review, tranche 2 final pass: a bad
+    relation_type is a validation error, but a nonexistent task_id/session_id
+    is a resource-not-found error, and conflating both into ValueError->400
+    was wrong)."""
+
 # Normalized token, not arbitrary text (OpenClaw's review, tranche 2,
 # 2026-08-14) -- keeps the join table's relation_type from ever becoming a
 # dumping ground for free-form/HTML-sized strings.
@@ -459,9 +468,9 @@ def link_task_session(task_id: int, session_id: int, relation_type: str, linked_
         raise ValueError(f"relation_type must match {RELATION_TYPE_RE.pattern!r}")
     with _connect() as conn:
         if not conn.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone():
-            raise ValueError(f"task {task_id} not found")
+            raise NotFoundError(f"task {task_id} not found")
         if not conn.execute("SELECT id FROM chat_sessions WHERE id=?", (session_id,)).fetchone():
-            raise ValueError(f"chat session {session_id} not found")
+            raise NotFoundError(f"chat session {session_id} not found")
         return _link_task_session(conn, task_id, session_id, relation_type, linked_by)
 
 
@@ -547,7 +556,7 @@ def start_chat_session(started_by: str = "", invite_task_id: int | None = None) 
         if invite_task_id is not None and not conn.execute(
             "SELECT id FROM tasks WHERE id=?", (invite_task_id,)
         ).fetchone():
-            raise ValueError(f"invite_task_id {invite_task_id} not found")
+            raise NotFoundError(f"invite_task_id {invite_task_id} not found")
         now = _now()
         cur = conn.execute(
             "INSERT INTO chat_sessions (status, started_by, started_at, invite_task_id) "

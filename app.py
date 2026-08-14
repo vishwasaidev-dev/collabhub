@@ -285,6 +285,8 @@ async def chat_start(request: Request) -> JSONResponse:
         body = await request.json()
     try:
         return JSONResponse(storage.start_chat_session(body.get("started_by", ""), body.get("invite_task_id")))
+    except storage.NotFoundError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -370,6 +372,8 @@ async def task_link_session(request: Request) -> JSONResponse:
         return JSONResponse(storage.link_task_session(
             task_id, int(body["session_id"]), body.get("relation_type", ""), body.get("linked_by", "")
         ))
+    except storage.NotFoundError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 

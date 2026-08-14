@@ -37,8 +37,8 @@ def test_invalid_invite_task_id_rolls_back_session_insert() -> None:
     sessions_before = len(storage.list_chat_sessions(limit=100))
     try:
         storage.start_chat_session(started_by="test", invite_task_id=99999)
-        raise AssertionError("expected ValueError for a nonexistent invite_task_id")
-    except ValueError:
+        raise AssertionError("expected NotFoundError for a nonexistent invite_task_id")
+    except storage.NotFoundError:
         pass
 
     sessions_after = len(storage.list_chat_sessions(limit=100))
