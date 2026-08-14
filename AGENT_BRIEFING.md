@@ -7,7 +7,8 @@ project, **read this file top to bottom before doing anything else.** It's kept
 up to date at the end of every tranche — if it looks stale (check the "Last updated"
 line against `git log -1`), trust `git log` and the task board over this file's prose.
 
-**Last updated:** 2026-08-14, after tranche 4 (Parts A+B) formally approved (commit `b27bd33`).
+**Last updated:** 2026-08-14, after tranche 5 (file attachments) formally approved (commit
+`5160fee`) — this was the last planned Priority-2 tranche; all of them are now shipped.
 
 **Fetching this file:** if you can `git clone`/read this repo's working tree
 directly, just open it. If you're OpenClaw specifically — your WSL sandbox has no
@@ -69,18 +70,22 @@ no access to this particular one. Use the OpenClaw-specific alternatives first:
    gets the full transcript. This is where design contracts get negotiated and
    review findings get reported in real time.
 3. **Read the tracking tasks' comment threads**: task `#8` (tranche 1, dashboard),
-   `#17` (tranche 2, chat history/linkage), `#20` (tranche 3, search). Each
-   comment thread is the full back-and-forth for that tranche — proposal, review
-   round(s), fixes, re-review, approval. `get_task(8|17|20)`.
+   `#17` (tranche 2, chat history/linkage), `#20` (tranche 3, search), `#24`
+   (tranche 4, task metadata + collapsible sections), `#54` (tranche 5, file
+   attachments). Each comment thread is the full back-and-forth for that
+   tranche — proposal, review round(s), fixes, re-review, approval.
+   `get_task(8|17|20|24|54)`.
 4. **`list_tasks()`** for current board state. As of this writing, tasks `#1-5`,
-   `#8`, `#17`, `#20` are real; there is no other live work in progress. (Earlier
-   task ids in that range that no longer exist, e.g. `#6,7,9-16,18,19,21-23`,
-   were Playwright acceptance-test artifacts that accumulated in the live DB
-   across tranches and were deleted once tranche 3's search made them visibly
-   polluting real results — see the `dc8e63f` commit message for exact IDs and
-   reasoning. If you're about to run acceptance tests that create real rows in
-   this DB, prefer a disposable DB or a clear test-marker convention so a future
-   cleanup pass doesn't need another manual inventory.)
+   `#8`, `#17`, `#20`, `#24`, `#54` are real; task `#3` (a second-opinion ask on
+   an unrelated Blender scene) is the only one still `open` — everything
+   tranche-related is `done`. (Earlier task ids in that range that no longer
+   exist, e.g. `#6,7,9-16,18,19,21-23`, were Playwright acceptance-test
+   artifacts that accumulated in the live DB across tranches and were deleted
+   once tranche 3's search made them visibly polluting real results — see the
+   `dc8e63f` commit message for exact IDs and reasoning. If you're about to run
+   acceptance tests that create real rows in this DB, prefer a disposable DB or
+   a clear test-marker convention so a future cleanup pass doesn't need another
+   manual inventory.)
 5. **This file** for the high-level shape of what's shipped and what's pending.
 
 ## What's shipped (all on GitHub `main`, `vishwasaidev-dev/collabhub`)
@@ -92,6 +97,7 @@ no access to this particular one. Use the OpenClaw-specific alternatives first:
 | Tranche 2 | Browsable chat history, deep-linkable transcript drawer (`?session=N`), many-to-many task↔chat-session linkage | **APPROVED** (task #17, 3 rounds / 13 issues) | `56790c8` → `f19c587` |
 | Tranche 3 | Full-text search (FTS5) across tasks/comments/notes/chat, around-message navigation (`?session=N&message=M`) | **APPROVED** (task #20, 2 rounds / 10 issues) | `dc8e63f` |
 | Tranche 4 | Task priority/due-date/checklist (Part A) **+** collapsible dashboard sections (Part B) | **APPROVED** (task #24, 6 review rounds — see below) | `8e32733` → `b27bd33` |
+| Tranche 5 | File attachments on tasks — upload/list/download/delete, opaque on-disk names, forced-download XSS mitigation | **APPROVED** (task #54, implementation + test review) | `12f39f9` → `5160fee` |
 
 Tranche 4 was an unusually dense review cycle, worth knowing about if you're
 about to touch this code: 6 rounds on task #24 (comments 52/54/56/57/58/59),
@@ -108,10 +114,81 @@ exactly the kind of thing that's easy to reintroduce by analogy in new code.
 
 ## What's still open
 
-- **Tranche 5**: file attachments on tasks/comments. Deliberately last — real
-  security-surface questions (path traversal, size/MIME limits, storage location)
-  that deserve their own careful design pass, not a bolt-on. Design contract
-  not yet posted as of this writing.
+Nothing. Tranche 5 was the last planned Priority-2 item and is shipped +
+approved. There is no tracked design contract awaiting review right now —
+task `#3` (a Blender second-opinion ask, unrelated to any tranche) is the only
+`open` task on the board. If you're picking this project up looking for the
+next thing to do, there isn't a queued one; ask the user or propose something
+new rather than assuming unfinished work exists.
+
+## Tranche 5: file attachments — what actually shipped
+
+Task-only scope (not per-comment — deliberately deferred, see task #54's
+description for the reasoning). Both REST and MCP surfaces exist, but the MCP
+side is metadata-only by design: `list_attachments(task_id)` is the only MCP
+tool, because multipart binary upload is awkward over JSON-RPC and OpenClaw's
+WSL sandbox can't touch local files directly anyway (same reasoning as
+`/files/`) — it fetches attachment bytes via the HTTP download route either
+way, so there's no MCP upload/download tool.
+
+**REST routes**: `POST/GET /api/tasks/{task_id}/attachments` (upload/list),
+`GET /api/tasks/{task_id}/attachments/{id}/download`,
+`DELETE /api/tasks/{task_id}/attachments/{id}`.
+
+**Limits** (all `os.environ`-configurable, defaults shown):
+10 MiB per file, 20 attachments per task, 1 GiB total across all attachments —
+enforced by counting bytes while streaming to disk, never trusting
+`Content-Length`. Env vars follow the `MAX_ATTACHMENT_BYTES` /
+`MAX_ATTACHMENTS_PER_TASK` / `MAX_TOTAL_ATTACHMENT_BYTES` names in
+`storage.py` if you need to override them for a specific deployment.
+
+**Path traversal closed structurally, not by sanitizing input**: every
+on-disk filename is a server-generated `secrets.token_hex(16)`
+(`storage_name`), re-validated against `STORAGE_NAME_RE` before every
+filesystem resolution. The user-supplied original filename is stored purely
+as display/`Content-Disposition` metadata and never touches a path. Files
+live flat under a new gitignored `attachments/` directory (sibling to
+`shared_files/`).
+
+**Always-octet forced download is the real anti-XSS mitigation**, not a MIME
+allowlist: `GET .../download` always serves
+`Content-Type: application/octet-stream` + `Content-Disposition: attachment`
++ `X-Content-Type-Options: nosniff` + `Cache-Control: private, no-store` +
+`Cross-Origin-Resource-Policy: same-origin`, regardless of what the uploader
+claimed the MIME type was. An uploaded HTML/SVG file can never be served back
+inline to execute same-origin JS, because it's never served inline at all.
+
+**New trusted-Origin/Host guard**: the two mutating attachment routes (upload,
+delete) are this project's first-ever *open* upload/delete surface (`/files/`
+is fed only by files Claude deliberately places there, a different trust
+model). `_check_trusted_origin()` in `app.py` rejects requests whose `Origin`
+or `Host` header doesn't match the expected loopback identity, closing a
+DNS-rebinding/hostile-webpage gap that never existed on this server before.
+
+**Writes are atomic and crash-safe**: uploads stream to a `.part` file first,
+then finalize via `os.link()` — never `os.replace()`/`os.rename()`, which
+silently overwrite an existing destination on a `storage_name` collision (this
+was a real bug caught in review; `os.link()` fails loudly with
+`FileExistsError` instead, surfaced as a `409`). The DB row is written only
+after the file is fully on disk, so a failed DB insert leaves an orphaned-but-
+inert file rather than a DB row pointing at nothing. `create_attachment()`
+uses a `BEGIN IMMEDIATE` transaction to close concurrent count-cap and
+global-byte-quota races.
+
+**Startup reconciliation**: `storage.reconcile_attachment_storage()` runs on
+every server start — removes stale `.part` files and DB-less orphaned files
+on disk, and *reports* (never deletes) any DB row whose backing file is
+missing, since deleting a row is a destructive call that belongs to a human
+or an explicit `DELETE` request, not a silent startup sweep.
+
+**Backup implication**: the SQLite DB and the `attachments/` directory are one
+logical backup unit — a DB backup without the directory (or vice versa) is
+incomplete and will show rows with no bytes (or bytes with no rows) after a
+restore. `attachments/` is gitignored, same as `shared_files/`, so the actual
+uploaded bytes are **not recoverable from git** — only from a real file-level
+backup of the machine. If this machine or its disk is ever lost, any
+attachments uploaded since the last such backup are gone; there is no
+git-based recovery path for them the way there is for code.
 
 ## Known gotchas — don't waste a review cycle rediscovering these
 
@@ -182,6 +259,28 @@ exactly the kind of thing that's easy to reintroduce by analogy in new code.
   former. If you need to suppress an ancestor's own handler, that ancestor's
   handler itself has to check the event target (`e.target.closest(...)`),
   not a listener further up the tree (task #24 comment 57).
+- **`os.replace()`/`os.rename()` silently overwrite an existing destination.**
+  If a filesystem write is meant to be a *new* file (e.g. a collision on a
+  supposedly-unique random name should be impossible but must still fail
+  safely if it somehow happens), use `os.link()` instead — it raises
+  `FileExistsError` rather than clobbering. Caught in tranche 5's review via a
+  dedicated collision test (task #54).
+- **A `visibility:hidden`-until-hover control loses focus across an
+  *unrelated* re-render that shifts its row on screen**, even if the control
+  itself didn't change — the re-render moves the row out from under the still
+  -hovering mouse, `:hover` drops, and the element goes invisible (and thus
+  unfocusable) again before focus-restoration logic can reach it. Fix: force
+  `el.style.visibility = "visible"` immediately before `.focus()` in the
+  render's restore path, not just on the element that actually changed
+  (tranche 5, task #54 — this bug recurred for both `.item-delete` and
+  `.attachment-delete` because the hover-reveal pattern itself was copied).
+- **Exception handling after a side-effecting call (e.g. writing a file) needs
+  a catch-all, not just the exception types you anticipated.** Tranche 5's
+  attachment upload originally caught only `NotFoundError`/`ValueError` after
+  `create_attachment()`, leaving the just-written file un-cleaned-up if some
+  *other* exception occurred (e.g. an event-write failure). Fixed with a
+  broad `except Exception: unlink(); raise` around the DB-write step whenever
+  a filesystem side effect precedes it (task #54).
 
 ## Where the durable disaster-recovery info lives
 

@@ -13,15 +13,43 @@ machine — not tied to any one project.
 
 ## What it is
 
-Starlette + FastMCP server, SQLite-backed. 9 MCP tools: `create_task`, `list_tasks`,
+Starlette + FastMCP server, SQLite-backed. 10 MCP tools: `create_task`, `list_tasks`,
 `get_task`, `claim_task`, `update_task`, `comment_task`, `complete_task`, `post_note`,
-`list_notes`. Plus a `/files/<subdir>/...` static route (backed by `shared_files/`,
-gitignored — populate it locally) for handing an agent an actual file, not just a path
-it might not be able to reach (e.g. OpenClaw running in a WSL distro with no
-filesystem access to the Windows drive).
+`list_notes`, `list_attachments`. Plus a `/files/<subdir>/...` static route (backed by
+`shared_files/`, gitignored — populate it locally) for handing an agent an actual file,
+not just a path it might not be able to reach (e.g. OpenClaw running in a WSL distro
+with no filesystem access to the Windows drive).
 
 Loopback-only (127.0.0.1), intentionally no auth — nothing but this machine (and,
 via WSL2 mirrored networking, this machine's WSL distros) can reach it.
+
+## File attachments
+
+Tasks can have file attachments (upload/list/download/delete), added via the
+dashboard or the REST routes under `/api/tasks/{id}/attachments`. A few things
+worth knowing before you touch this data outside the app:
+
+- Attachment bytes live in a gitignored `attachments/` directory (sibling to
+  `shared_files/`), named with opaque server-generated tokens — never the
+  original filename. **The SQLite DB and `attachments/` are one logical backup
+  unit.** Back them up together; a DB-only backup will restore rows pointing at
+  missing files, and an `attachments/`-only backup is just anonymous blobs with
+  no metadata.
+- Attachment bytes are **not recoverable from git** (the directory is
+  gitignored, same as `shared_files/`) — only from a real file-level backup of
+  this machine. If the machine or disk is lost, any attachments uploaded since
+  the last such backup are gone for good.
+- Default limits (env-configurable — see `MAX_ATTACHMENT_BYTES`,
+  `MAX_ATTACHMENTS_PER_TASK`, `MAX_TOTAL_ATTACHMENT_BYTES` in `storage.py`):
+  10 MiB per file, 20 attachments per task, 1 GiB total across all attachments.
+- Downloads are always served as `application/octet-stream` with a forced
+  `Content-Disposition: attachment`, regardless of the file's real type — this
+  is the actual anti-XSS mitigation (no MIME allowlist needed), so an uploaded
+  HTML/SVG file can never execute same-origin JS by being rendered inline.
+
+See [`AGENT_BRIEFING.md`](AGENT_BRIEFING.md) for the full design rationale
+(path-traversal model, atomic writes, trusted-Origin guard, startup
+reconciliation).
 
 ## Setup on a fresh machine
 
@@ -60,7 +88,7 @@ Add to the project's `.mcp.json`:
 
 ```bash
 openclaw mcp add collabhub --url http://127.0.0.1:8765/mcp --transport streamable-http --parallel
-openclaw mcp probe collabhub   # should report 9 tools
+openclaw mcp probe collabhub   # should report 10 tools
 ```
 
 ### Cross-OS reachability (Windows host + WSL2 agent)
