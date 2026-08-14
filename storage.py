@@ -14,13 +14,34 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 DB_PATH = Path(__file__).resolve().parent / "collabhub.sqlite3"
 
 VALID_STATUSES = ("open", "claimed", "in_progress", "blocked", "done")
+
+# --- Task metadata (tranche 4) constants ------------------------------------
+VALID_PRIORITIES = ("low", "normal", "high", "urgent")
+CHECKLIST_MAX_ITEM_LEN = 300
+CHECKLIST_MAX_ITEMS_PER_TASK = 50
+# Sentinel distinguishing "due_date not mentioned in this call -- leave
+# unchanged" from "due_date explicitly passed as null -- clear it". A bare
+# `None` default can't carry this distinction (OpenClaw's review, tranche 4:
+# omission and explicit-null are different operations and must stay
+# distinguishable through both REST and MCP).
+_OMITTED = object()
+
+
+def _validate_due_date(value: str) -> None:
+    """A due date is a calendar commitment, not an instant -- validate with a
+    real date parser (rejects e.g. 2026-02-30), not a regex that would accept
+    syntactically-shaped nonsense (OpenClaw's review)."""
+    try:
+        date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"due_date must be a valid YYYY-MM-DD calendar date: {exc}") from None
 
 
 class NotFoundError(Exception):
@@ -86,11 +107,22 @@ def init_db() -> None:
                 assignee TEXT,
                 created_by TEXT NOT NULL DEFAULT '',
                 tags TEXT NOT NULL DEFAULT '',
+                priority TEXT NOT NULL DEFAULT 'normal'
+                    CHECK(priority IN ('low','normal','high','urgent')),
+                due_date TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        # Migration for a DB that predates priority/due_date (mirrors the
+        # invite_task_id precedent below) -- existing rows backfill to the
+        # column default ('normal'), enforced by both this CHECK and
+        # application-level validation (OpenClaw's review: belt and
+        # suspenders, not either alone).
+        _ensure_column(conn, "tasks", "priority",
+                        "priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('low','normal','high','urgent'))")
+        _ensure_column(conn, "tasks", "due_date", "due_date TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS comments (
@@ -188,6 +220,32 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tcs_task ON task_chat_sessions(task_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tcs_session ON task_chat_sessions(session_id)")
+
+        # Checklist items (tranche 4). Deliberately no `position` column --
+        # computing MAX(position)+1 then inserting is a genuine TOCTOU race
+        # across two concurrent writers (the read and the write aren't one
+        # atomic step), and a UNIQUE(task_id, position) constraint would just
+        # turn that race into an occasional failed write instead of a silent
+        # duplicate. Since this tranche has no reorder feature, `id` order
+        # (inherently race-free -- SQLite's own PK allocation) is both
+        # simpler and actually correct; add position later only alongside a
+        # real reorder feature that needs it (OpenClaw's review).
+        # ON DELETE CASCADE here (unlike task_chat_sessions' deliberate NO
+        # ACTION) because a checklist item has no independent existence once
+        # its task is gone.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_checklist_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                text TEXT NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0 CHECK(done IN (0,1)),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_checklist_task ON task_checklist_items(task_id)")
 
         # Unified full-text search index (tranche 3). `content` is the only
         # tokenized/searchable column; everything else is UNINDEXED metadata
@@ -301,10 +359,12 @@ def catch_up(agent: str, after_cursor: int | None = None) -> dict:
 
         _touch_presence(conn, agent, "catch_up")
 
-        my_tasks = conn.execute(
+        my_tasks_rows = conn.execute(
             "SELECT * FROM tasks WHERE assignee=? AND status!='done' ORDER BY updated_at DESC",
             (agent,),
         ).fetchall()
+        my_tasks = [_task_row_to_dict(r) for r in my_tasks_rows]
+        _hydrate_checklists(conn, my_tasks)
         active_chat = conn.execute(
             "SELECT * FROM chat_sessions WHERE status='active' ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -315,7 +375,7 @@ def catch_up(agent: str, after_cursor: int | None = None) -> dict:
             "next_cursor": next_cursor,
             "unread_count": len(events),
             "events": events,
-            "my_open_tasks": [_task_row_to_dict(r) for r in my_tasks],
+            "my_open_tasks": my_tasks,
             "active_chat_session": dict(active_chat) if active_chat else None,
         }
 
@@ -348,18 +408,57 @@ def _task_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return d
 
 
-def create_task(title: str, description: str = "", created_by: str = "", tags: list[str] | None = None) -> dict:
+def _checklist_item_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    d = dict(row)
+    d["done"] = bool(d["done"])
+    return d
+
+
+def _hydrate_checklists(conn: sqlite3.Connection, tasks: list[dict]) -> None:
+    """Batched (no N+1) checklist attachment -- mutates each task dict in
+    place, adding checklist_items + checklist_progress. Called from every
+    task-list shape (list_tasks, full_state, catch_up), not just get_task --
+    otherwise the dashboard's initial load (from /api/state) would show
+    tasks without checklist data until each one happened to get a live
+    event and trigger an individual refetch (OpenClaw's review, tranche 4)."""
+    if not tasks:
+        return
+    task_ids = [t["id"] for t in tasks]
+    placeholders = ",".join("?" * len(task_ids))
+    rows = conn.execute(
+        f"SELECT * FROM task_checklist_items WHERE task_id IN ({placeholders}) ORDER BY task_id, id ASC",
+        task_ids,
+    ).fetchall()
+    items_by_task: dict[int, list[dict]] = {}
+    for r in rows:
+        items_by_task.setdefault(r["task_id"], []).append(_checklist_item_to_dict(r))
+    for t in tasks:
+        items = items_by_task.get(t["id"], [])
+        t["checklist_items"] = items
+        t["checklist_progress"] = {"done": sum(1 for i in items if i["done"]), "total": len(items)}
+
+
+def create_task(
+    title: str, description: str = "", created_by: str = "", tags: list[str] | None = None,
+    priority: str = "normal", due_date: str | None = None,
+) -> dict:
+    if priority not in VALID_PRIORITIES:
+        raise ValueError(f"invalid priority {priority!r}; must be one of {VALID_PRIORITIES}")
+    if due_date is not None:
+        _validate_due_date(due_date)
     now = _now()
     tags_str = ",".join(tags or [])
     with _connect() as conn:
         cur = conn.execute(
-            "INSERT INTO tasks (title, description, status, created_by, tags, created_at, updated_at) "
-            "VALUES (?, ?, 'open', ?, ?, ?, ?)",
-            (title, description, created_by, tags_str, now, now),
+            "INSERT INTO tasks (title, description, status, created_by, tags, priority, due_date, created_at, updated_at) "
+            "VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?)",
+            (title, description, created_by, tags_str, priority, due_date, now, now),
         )
         task_id = cur.lastrowid
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         task = _task_row_to_dict(row)
+        task["checklist_items"] = []
+        task["checklist_progress"] = {"done": 0, "total": 0}
         _emit_event(conn, "task_created", {"task_id": task_id, "title": title, "created_by": created_by})
         _touch_presence(conn, created_by, "create_task")
         _index_for_search(conn, "task", task_id, None, _task_search_content(title, description, tags_str), created_by, now)
@@ -380,7 +479,9 @@ def list_tasks(status: str | None = None, assignee: str | None = None) -> list[d
     q += " ORDER BY updated_at DESC"
     with _connect() as conn:
         rows = conn.execute(q, params).fetchall()
-        return [_task_row_to_dict(r) for r in rows]
+        tasks = [_task_row_to_dict(r) for r in rows]
+        _hydrate_checklists(conn, tasks)
+        return tasks
 
 
 def get_task(task_id: int) -> dict | None:
@@ -397,6 +498,7 @@ def get_task(task_id: int) -> dict | None:
         # its messages/other linked tasks (OpenClaw's review: avoid recursive
         # full objects).
         task["chat_sessions"] = _task_chat_session_summaries(conn, task_id)
+        _hydrate_checklists(conn, [task])
         return task
 
 
@@ -405,9 +507,15 @@ def update_task(
     status: str | None = None,
     description: str | None = None,
     assignee: str | None = None,
+    priority: str | None = None,
+    due_date: str | None = _OMITTED,
 ) -> dict | None:
     if status is not None and status not in VALID_STATUSES:
         raise ValueError(f"invalid status {status!r}; must be one of {VALID_STATUSES}")
+    if priority is not None and priority not in VALID_PRIORITIES:
+        raise ValueError(f"invalid priority {priority!r}; must be one of {VALID_PRIORITIES}")
+    if due_date is not _OMITTED and due_date is not None:
+        _validate_due_date(due_date)
     with _connect() as conn:
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
@@ -422,12 +530,22 @@ def update_task(
         if assignee is not None:
             fields.append("assignee=?")
             params.append(assignee)
+        if priority is not None:
+            fields.append("priority=?")
+            params.append(priority)
+        if due_date is not _OMITTED:
+            # due_date itself may be None here -- that's the explicit-clear
+            # case (NULL), distinct from _OMITTED ("don't touch this
+            # column", the default when the param isn't passed at all).
+            fields.append("due_date=?")
+            params.append(due_date)
         fields.append("updated_at=?")
         params.append(_now())
         params.append(task_id)
         conn.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", params)
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         task = _task_row_to_dict(row)
+        _hydrate_checklists(conn, [task])
         _emit_event(conn, "task_updated", {"task_id": task_id, "status": task["status"], "assignee": task.get("assignee")})
         if assignee:
             _touch_presence(conn, assignee, "update_task")
@@ -440,6 +558,80 @@ def update_task(
             task.get("created_by", ""), task["updated_at"],
         )
         return task
+
+
+def add_checklist_item(task_id: int, text: str) -> dict:
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("checklist item text must not be empty")
+    if len(text) > CHECKLIST_MAX_ITEM_LEN:
+        raise ValueError(f"checklist item text must be <= {CHECKLIST_MAX_ITEM_LEN} characters")
+    with _connect() as conn:
+        if not conn.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone():
+            raise NotFoundError(f"task {task_id} not found")
+        count = conn.execute(
+            "SELECT COUNT(*) AS c FROM task_checklist_items WHERE task_id=?", (task_id,)
+        ).fetchone()["c"]
+        if count >= CHECKLIST_MAX_ITEMS_PER_TASK:
+            raise ValueError(f"task {task_id} already has the maximum of {CHECKLIST_MAX_ITEMS_PER_TASK} checklist items")
+        now = _now()
+        cur = conn.execute(
+            "INSERT INTO task_checklist_items (task_id, text, done, created_at, updated_at) VALUES (?, ?, 0, ?, ?)",
+            (task_id, text, now, now),
+        )
+        item_id = cur.lastrowid
+        row = conn.execute("SELECT * FROM task_checklist_items WHERE id=?", (item_id,)).fetchone()
+        item = _checklist_item_to_dict(row)
+        # Checklist activity counts as task activity -- the board is sorted
+        # by updated_at, and this is exactly the kind of change that should
+        # surface a task near the top (OpenClaw's review: explicit yes here).
+        conn.execute("UPDATE tasks SET updated_at=? WHERE id=?", (now, task_id))
+        _emit_event(conn, "checklist_item_added", {"task_id": task_id, "item_id": item_id, "text": text})
+        return item
+
+
+def set_checklist_item_done(task_id: int, item_id: int, done: bool) -> dict:
+    """`done` must be an actual bool -- a JSON `1`/`"true"` is rejected, not
+    coerced, per OpenClaw's review (strict JSON bool behavior). Validates
+    item_id actually belongs to task_id, distinct from item_id simply not
+    existing at all -- both are 404s at the REST layer, but this keeps the
+    check explicit rather than accidentally operating on the wrong task's
+    item because two ids happened to both exist somewhere in the table."""
+    if not isinstance(done, bool):
+        raise ValueError("done must be a boolean")
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM task_checklist_items WHERE id=?", (item_id,)).fetchone()
+        if not row or row["task_id"] != task_id:
+            raise NotFoundError(f"checklist item {item_id} not found in task {task_id}")
+        now = _now()
+        conn.execute(
+            "UPDATE task_checklist_items SET done=?, updated_at=? WHERE id=?",
+            (1 if done else 0, now, item_id),
+        )
+        conn.execute("UPDATE tasks SET updated_at=? WHERE id=?", (now, task_id))
+        row = conn.execute("SELECT * FROM task_checklist_items WHERE id=?", (item_id,)).fetchone()
+        item = _checklist_item_to_dict(row)
+        _emit_event(conn, "checklist_item_updated", {"task_id": task_id, "item_id": item_id, "done": item["done"]})
+        return item
+
+
+def delete_checklist_item(task_id: int, item_id: int) -> bool:
+    """Idempotent and task-scoped: an item that's already gone, or that
+    never belonged to this task_id, both just return False -- no error.
+    From a caller scoped to a specific task, both cases mean the same thing
+    ("there's nothing to delete here"), so there's no need to distinguish
+    them (OpenClaw's review asked for delete semantics to be defined)."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM task_checklist_items WHERE id=? AND task_id=?", (item_id, task_id)
+        ).fetchone()
+        if not row:
+            return False
+        now = _now()
+        conn.execute("DELETE FROM task_checklist_items WHERE id=?", (item_id,))
+        conn.execute("UPDATE tasks SET updated_at=? WHERE id=?", (now, task_id))
+        _emit_event(conn, "checklist_item_removed", {"task_id": task_id, "item_id": item_id})
+        return True
 
 
 def add_comment(task_id: int, author: str, text: str) -> dict | None:
@@ -1217,6 +1409,7 @@ def full_state() -> dict:
     with _connect() as conn:
         conn.execute("BEGIN")
         tasks = [_task_row_to_dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY updated_at DESC").fetchall()]
+        _hydrate_checklists(conn, tasks)
         notes = [dict(r) for r in conn.execute("SELECT * FROM notes ORDER BY created_at DESC LIMIT 100").fetchall()]
         active_chat_row = conn.execute(
             "SELECT * FROM chat_sessions WHERE status='active' ORDER BY id DESC LIMIT 1"

@@ -81,6 +81,42 @@
     background: color-mix(in srgb, var(--accent) 18%, transparent);
     color: var(--accent); padding: 1px 8px; border-radius: 999px; font-weight: 600;
   }
+  .priority {
+    display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px;
+    font-weight: 600; color: #fff;
+  }
+  .priority.low { background: var(--muted); }
+  .priority.normal { display: none; } /* the common case -- don't add visual noise for the default */
+  .priority.high { background: var(--claimed); }
+  .priority.urgent { background: var(--blocked); }
+  .due-date { display: inline-flex; align-items: center; gap: 3px; }
+  .due-date.overdue { color: var(--blocked); font-weight: 600; }
+  .due-date.overdue::before { content: "⚠"; } /* icon, not color alone, marks overdue -- OpenClaw's review */
+  .checklist { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 6px; }
+  .checklist-progress { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .checklist-items { max-height: 160px; overflow-y: auto; display: flex; flex-direction: column; gap: 3px; }
+  .checklist-item {
+    display: flex; align-items: flex-start; gap: 6px; font-size: 12.5px; cursor: pointer;
+    padding: 2px 0;
+  }
+  .checklist-item input[type="checkbox"] { margin-top: 2px; flex: none; }
+  .checklist-item .item-text { flex: 1; word-break: break-word; }
+  .checklist-item .item-text.done { text-decoration: line-through; color: var(--muted); }
+  .checklist-item.checklist-error .item-text { color: var(--blocked); }
+  .checklist-item .item-delete {
+    flex: none; background: none; border: none; color: var(--muted); cursor: pointer;
+    font-size: 13px; line-height: 1; padding: 0 2px; visibility: hidden;
+  }
+  .checklist-item:hover .item-delete { visibility: visible; }
+  .checklist-add { display: flex; gap: 4px; margin-top: 6px; }
+  .checklist-add input {
+    flex: 1; font-size: 12px; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text);
+  }
+  .checklist-add button {
+    font-size: 12px; padding: 3px 8px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); cursor: pointer;
+  }
   .empty { color: var(--muted); font-size: 12.5px; padding: 8px 2px; }
   .panel {
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px;
@@ -306,6 +342,10 @@ let lastAppliedEventId = 0; // dedupe/idempotency gate -- ignore event.id <= thi
 let recoveryRequired = false;
 let pageLoadCursor = 0;     // event_cursor at initial load, for "N new" badges
 let newCounts = { tasks: 0, notes: 0, chat: 0 };
+// Checklist items with an in-flight PATCH/DELETE, keyed "taskId:itemId" --
+// rendered disabled so a mid-flight renderBoard() (triggered by an unrelated
+// event) can't offer a second click on the same request.
+let pendingChecklistOps = new Set();
 
 function fmtTime(iso) {
   try {
@@ -327,26 +367,78 @@ function relTime(iso) {
 function esc(s) {
   return (s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
+// `new Date('YYYY-MM-DD')` parses as UTC midnight, which renders as the
+// PREVIOUS calendar day in any negative-UTC-offset timezone -- parse the
+// components manually and build via the local constructor instead.
+function parseLocalDate(ymd) {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+function fmtDueDate(ymd) {
+  return parseLocalDate(ymd).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+function isOverdue(ymd) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return parseLocalDate(ymd).getTime() < today.getTime();
+}
 
 // --- rendering (always derived from the Maps above) -------------------------
 
+function checklistHtml(t) {
+  const items = t.checklist_items || [];
+  const progress = t.checklist_progress || { done: 0, total: 0 };
+  const itemsHtml = items.map(it => {
+    const busy = pendingChecklistOps.has(`${t.id}:${it.id}`);
+    return `
+      <div class="checklist-item" data-item-id="${it.id}">
+        <input type="checkbox" ${it.done ? "checked" : ""} ${busy ? "disabled" : ""}
+               data-task-id="${t.id}" data-item-id="${it.id}" aria-label="${esc(it.text)}">
+        <span class="item-text ${it.done ? "done" : ""}">${esc(it.text)}</span>
+        <button type="button" class="item-delete" data-task-id="${t.id}" data-item-id="${it.id}"
+                ${busy ? "disabled" : ""} aria-label="Delete checklist item: ${esc(it.text)}">&times;</button>
+      </div>`;
+  }).join("");
+  return `
+    <div class="checklist">
+      ${progress.total ? `<div class="checklist-progress">${progress.done}/${progress.total} checked off</div>` : ""}
+      ${items.length ? `<div class="checklist-items">${itemsHtml}</div>` : ""}
+      <form class="checklist-add" data-task-id="${t.id}">
+        <input type="text" maxlength="300" placeholder="Add checklist item…" aria-label="New checklist item for task #${t.id}">
+        <button type="submit">Add</button>
+      </form>
+    </div>`;
+}
+
 function taskCard(t) {
+  const overdue = t.due_date && t.status !== "done" && isOverdue(t.due_date);
   return `
     <div class="card" data-task-id="${t.id}">
       <div class="title">#${t.id} ${esc(t.title)}</div>
       ${t.description ? `<div class="desc">${esc(t.description)}</div>` : ""}
       <div class="meta">
         <span class="badge ${t.status}">${t.status.replace("_"," ")}</span>
+        <span class="priority ${t.priority || "normal"}">${t.priority || "normal"}</span>
+        ${t.due_date ? `<span class="due-date ${overdue ? "overdue" : ""}">${overdue ? "Overdue: " : "Due "}${fmtDueDate(t.due_date)}</span>` : ""}
         ${t.assignee ? `<span class="assignee">${esc(t.assignee)}</span>` : ""}
         <span>by ${esc(t.created_by || "?")}</span>
         <time>${fmtTime(t.updated_at)}</time>
       </div>
+      ${checklistHtml(t)}
     </div>`;
 }
 
 function renderBoard() {
-  const tasks = [...tasksById.values()].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
   const board = document.getElementById("board");
+  // Preserve focus across the full innerHTML replacement below -- otherwise
+  // every checklist checkbox/delete click (which triggers a renderBoard())
+  // drops keyboard focus back to <body>, breaking keyboard-only use.
+  const active = document.activeElement;
+  const restore = (active && board.contains(active) && active.dataset.taskId && active.dataset.itemId)
+    ? { tag: active.tagName.toLowerCase(), taskId: active.dataset.taskId, itemId: active.dataset.itemId }
+    : null;
+
+  const tasks = [...tasksById.values()].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
   const groups = { open: [], claimed: [], in_progress: [], blocked: [], done: [] };
   for (const t of tasks) (groups[t.status] || groups.open).push(t);
 
@@ -360,7 +452,99 @@ function renderBoard() {
     </div>
   `).join("");
   renderNewCount("tasks");
+
+  if (restore) {
+    const el = board.querySelector(`${restore.tag}[data-task-id="${restore.taskId}"][data-item-id="${restore.itemId}"]`);
+    if (el) el.focus();
+  }
 }
+
+// --- checklist interactions ---------------------------------------------
+// Event delegation on the persistent #board container (attached once below,
+// not re-bound after every renderBoard()'s innerHTML replacement) -- same
+// pattern the codebase already uses for header click-to-clear elsewhere.
+
+async function toggleChecklistItem(taskId, itemId, done) {
+  const key = `${taskId}:${itemId}`;
+  pendingChecklistOps.add(key);
+  renderBoard();
+  try {
+    const res = await fetch(`/api/tasks/${taskId}/checklist/${itemId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ done }),
+    });
+    if (!res.ok) throw new Error(String(res.status));
+    const task = await fetchTask(taskId);
+    if (task) tasksById.set(task.id, task);
+  } catch {
+    // Leave tasksById untouched -- since we never mutated it optimistically,
+    // the re-render below reverts the checkbox to the last known-good
+    // server state on its own; never a blind manual invert.
+  } finally {
+    pendingChecklistOps.delete(key);
+    renderBoard();
+  }
+}
+
+async function deleteChecklistItem(taskId, itemId) {
+  const key = `${taskId}:${itemId}`;
+  pendingChecklistOps.add(key);
+  renderBoard();
+  try {
+    const res = await fetch(`/api/tasks/${taskId}/checklist/${itemId}`, { method: "DELETE" });
+    if (!res.ok) throw new Error(String(res.status));
+    const task = await fetchTask(taskId);
+    if (task) tasksById.set(task.id, task);
+  } catch {
+    // ditto -- leave tasksById alone, the item reappears on re-render.
+  } finally {
+    pendingChecklistOps.delete(key);
+    renderBoard();
+  }
+}
+
+async function addChecklistItem(taskId, text, formEl) {
+  const btn = formEl.querySelector("button");
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/tasks/${taskId}/checklist`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      alert(body.error || "Could not add checklist item.");
+      return;
+    }
+    const task = await fetchTask(taskId);
+    if (task) { tasksById.set(task.id, task); renderBoard(); }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById("board").addEventListener("change", (e) => {
+  const cb = e.target.closest('input[type="checkbox"][data-item-id]');
+  if (!cb) return;
+  toggleChecklistItem(Number(cb.dataset.taskId), Number(cb.dataset.itemId), cb.checked);
+});
+document.getElementById("board").addEventListener("click", (e) => {
+  const btn = e.target.closest(".item-delete");
+  if (!btn) return;
+  deleteChecklistItem(Number(btn.dataset.taskId), Number(btn.dataset.itemId));
+});
+document.getElementById("board").addEventListener("submit", (e) => {
+  const form = e.target.closest(".checklist-add");
+  if (!form) return;
+  e.preventDefault();
+  const input = form.querySelector("input");
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  addChecklistItem(Number(form.dataset.taskId), text, form);
+});
 
 function renderNotes() {
   const notes = [...notesById.values()].sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
@@ -560,7 +744,10 @@ async function applyEvent(evt) {
   switch (evt.type) {
     case "task_created":
     case "task_updated":
-    case "task_commented": {
+    case "task_commented":
+    case "checklist_item_added":
+    case "checklist_item_updated":
+    case "checklist_item_removed": {
       const task = await fetchTask(evt.payload.task_id);
       if (!task) {
         // Transient fetch failure: open the recovery barrier immediately so
@@ -768,7 +955,8 @@ async function connectSSE() {
   es.onmessage = (msg) => { try { onSSEMessage(msg); } catch { /* malformed frame */ } };
   for (const t of ["task_created", "task_updated", "task_commented", "note_posted",
                     "chat_message", "chat_session_started", "chat_session_ended",
-                    "task_session_linked", "task_session_unlinked"]) {
+                    "task_session_linked", "task_session_unlinked",
+                    "checklist_item_added", "checklist_item_updated", "checklist_item_removed"]) {
     es.addEventListener(t, (msg) => { try { onSSEMessage(msg); } catch { /* malformed frame */ } });
   }
   es.onerror = () => {

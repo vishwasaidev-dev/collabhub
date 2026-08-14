@@ -49,10 +49,15 @@ mcp = FastMCP(
 
 @mcp.tool(name="create_task", description=(
     "Create a new shared task on the board. Use this to hand work to the other agent, "
-    "or to log work you're about to start so it's visible. Returns the created task."
+    "or to log work you're about to start so it's visible. priority is one of "
+    "low/normal/high/urgent (default normal). due_date, if given, is a calendar date "
+    "YYYY-MM-DD (e.g. '2026-03-15'), not a timestamp. Returns the created task."
 ))
-def create_task_tool(title: str, description: str = "", created_by: str = "", tags: list[str] | None = None) -> dict:
-    return storage.create_task(title, description, created_by, tags)
+def create_task_tool(
+    title: str, description: str = "", created_by: str = "", tags: list[str] | None = None,
+    priority: str = "normal", due_date: str | None = None,
+) -> dict:
+    return storage.create_task(title, description, created_by, tags, priority, due_date)
 
 
 @mcp.tool(name="list_tasks", description=(
@@ -78,12 +83,49 @@ def claim_task_tool(task_id: int, assignee: str) -> dict | None:
 
 
 @mcp.tool(name="update_task", description=(
-    "Update a task's status (open/claimed/in_progress/blocked/done) and/or description. "
-    "Omit fields you don't want to change. Raises on an invalid status instead of silently "
-    "corrupting the task."
+    "Update a task's status/description/priority/due_date. Omit fields you don't want to "
+    "change. To CLEAR a due date (not just leave it unset), pass clear_due_date=true -- "
+    "passing due_date alone only sets a new one, it can't distinguish 'leave it alone' from "
+    "'remove it' the way a REST client's JSON body can via an explicit null. Raises on an "
+    "invalid status/priority/date instead of silently corrupting the task."
 ))
-def update_task_tool(task_id: int, status: str | None = None, description: str | None = None) -> dict | None:
-    return storage.update_task(task_id, status=status, description=description)
+def update_task_tool(
+    task_id: int, status: str | None = None, description: str | None = None,
+    assignee: str | None = None, priority: str | None = None,
+    due_date: str | None = None, clear_due_date: bool = False,
+) -> dict | None:
+    # storage.update_task's due_date param is tri-state (omitted/None/value) via
+    # a sentinel default -- that sentinel isn't representable in an MCP tool's
+    # JSON schema, so this tool exposes the same three states through two
+    # plain params instead: clear_due_date=true means "clear it" regardless of
+    # due_date; otherwise a given due_date sets it; otherwise it's untouched.
+    due_date_arg = storage._OMITTED
+    if clear_due_date:
+        due_date_arg = None
+    elif due_date is not None:
+        due_date_arg = due_date
+    return storage.update_task(
+        task_id, status=status, description=description, assignee=assignee,
+        priority=priority, due_date=due_date_arg,
+    )
+
+
+@mcp.tool(name="add_checklist_item", description=(
+    "Add a checklist item to a task (max 300 chars, max 50 items per task). "
+    "Counts as task activity -- bumps the task's updated_at."
+))
+def add_checklist_item_tool(task_id: int, text: str) -> dict:
+    return storage.add_checklist_item(task_id, text)
+
+
+@mcp.tool(name="toggle_checklist_item", description="Set a checklist item's done state (must be a real boolean).")
+def toggle_checklist_item_tool(task_id: int, item_id: int, done: bool) -> dict:
+    return storage.set_checklist_item_done(task_id, item_id, done)
+
+
+@mcp.tool(name="delete_checklist_item", description="Remove a checklist item. Idempotent -- returns whether anything was actually removed.")
+def delete_checklist_item_tool(task_id: int, item_id: int) -> bool:
+    return storage.delete_checklist_item(task_id, item_id)
 
 
 @mcp.tool(name="comment_task", description=(
@@ -495,9 +537,13 @@ async def tasks_list(request: Request) -> JSONResponse:
 
 async def tasks_create(request: Request) -> JSONResponse:
     body = await request.json()
-    task = storage.create_task(
-        body.get("title", ""), body.get("description", ""), body.get("created_by", ""), body.get("tags")
-    )
+    try:
+        task = storage.create_task(
+            body.get("title", ""), body.get("description", ""), body.get("created_by", ""), body.get("tags"),
+            body.get("priority", "normal"), body.get("due_date"),
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     return JSONResponse(task)
 
 
@@ -510,16 +556,57 @@ async def task_get(request: Request) -> JSONResponse:
 
 async def task_update(request: Request) -> JSONResponse:
     body = await request.json()
+    # due_date is tri-state: key absent from the body -> leave unchanged;
+    # key present with JSON null -> clear it; key present with a value ->
+    # set it. This only works because REST bodies are plain dicts where
+    # "absent" and "explicitly null" are naturally distinguishable -- the
+    # MCP tool needs a different mechanism (see update_task_tool) since a
+    # JSON-RPC/tool-schema call can't carry that same distinction as cleanly.
+    kwargs: dict[str, Any] = {}
+    for key in ("status", "description", "assignee", "priority"):
+        if key in body:
+            kwargs[key] = body[key]
+    if "due_date" in body:
+        kwargs["due_date"] = body["due_date"]
     try:
-        task = storage.update_task(
-            int(request.path_params["task_id"]),
-            status=body.get("status"), description=body.get("description"), assignee=body.get("assignee"),
-        )
+        task = storage.update_task(int(request.path_params["task_id"]), **kwargs)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     if task is None:
         return JSONResponse({"error": "task not found"}, status_code=404)
     return JSONResponse(task)
+
+
+async def task_checklist_create(request: Request) -> JSONResponse:
+    task_id = int(request.path_params["task_id"])
+    body = await request.json()
+    try:
+        item = storage.add_checklist_item(task_id, body.get("text", ""))
+    except storage.NotFoundError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse(item)
+
+
+async def task_checklist_update(request: Request) -> JSONResponse:
+    task_id = int(request.path_params["task_id"])
+    item_id = int(request.path_params["item_id"])
+    body = await request.json()
+    try:
+        item = storage.set_checklist_item_done(task_id, item_id, body.get("done"))
+    except storage.NotFoundError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse(item)
+
+
+async def task_checklist_delete(request: Request) -> JSONResponse:
+    task_id = int(request.path_params["task_id"])
+    item_id = int(request.path_params["item_id"])
+    removed = storage.delete_checklist_item(task_id, item_id)
+    return JSONResponse({"removed": removed})
 
 
 async def task_claim(request: Request) -> JSONResponse:
@@ -696,6 +783,9 @@ def build_app() -> Starlette:
             Route("/api/tasks/{task_id:int}/claim", task_claim, methods=["POST"]),
             Route("/api/tasks/{task_id:int}/comment", task_comment, methods=["POST"]),
             Route("/api/tasks/{task_id:int}/complete", task_complete, methods=["POST"]),
+            Route("/api/tasks/{task_id:int}/checklist", task_checklist_create, methods=["POST"]),
+            Route("/api/tasks/{task_id:int}/checklist/{item_id:int}", task_checklist_update, methods=["PATCH"]),
+            Route("/api/tasks/{task_id:int}/checklist/{item_id:int}", task_checklist_delete, methods=["DELETE"]),
             Route("/api/tasks/{task_id:int}/link", task_link_session, methods=["POST"]),
             Route("/api/tasks/{task_id:int}/unlink", task_unlink_session, methods=["POST"]),
             Route("/api/notes", notes_list),
