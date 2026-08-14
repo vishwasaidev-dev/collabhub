@@ -384,13 +384,26 @@ async function applyEvent(evt) {
     case "task_commented": {
       const task = await fetchTask(evt.payload.task_id);
       if (!task) {
-        // Transient fetch failure: do NOT commit this event id -- committing
-        // it here would permanently dedupe an event whose effect was never
-        // actually applied, leaving the card stale until some unrelated
-        // reconnect happened to fix it. Reconcile with a full resync instead
-        // and let this event id be retried (a resync moves lastAppliedEventId
-        // itself, so nothing double-applies) (OpenClaw's review, point 3).
-        fullResyncSingleFlight().catch(() => {});
+        // Transient fetch failure: reconcile with a full resync, and AWAIT
+        // it -- this runs inside the serialized queue (queueApply), so
+        // returning before the resync settles would let the next queued
+        // event run immediately and advance lastAppliedEventId past this
+        // gap before (or even if) the resync ever completes. Second bug in
+        // the same spot: fullResync() returns the cursor but was never
+        // actually assigned to lastAppliedEventId here, so even a completed
+        // resync wasn't closing the gap (OpenClaw's re-review, 2026-08-14 --
+        // caught both on a second pass after the first fix attempt).
+        try {
+          const cursor = await fullResyncSingleFlight();
+          lastAppliedEventId = Math.max(lastAppliedEventId, cursor);
+        } catch {
+          // The resync itself failed -- don't swallow it and let later
+          // events leapfrog past an unresolved gap. Force the SSE
+          // reconnect path, which performs its own resync (with its own
+          // backoff/retry) and will close the gap once it succeeds.
+          if (es) { es.close(); }
+          connectSSE();
+        }
         return;
       }
       tasksById.set(task.id, task);
