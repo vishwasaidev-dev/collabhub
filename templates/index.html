@@ -127,6 +127,19 @@
     display: flex; align-items: center; gap: 6px; cursor: default;
   }
   .panel h2.clickable { cursor: pointer; }
+  /* Collapsible sections (board columns + sidebar panels): the toggle is a
+     real <button>, not a clickable div -- Enter/Space/click all work for
+     free via native button semantics, no manual role/tabindex/keydown
+     handling needed (OpenClaw's review). Collapsing hides everything in the
+     section EXCEPT its own h2 -- header text, "N new" badges, and column
+     counts stay visible and keep updating from live events while collapsed. */
+  .collapse-toggle {
+    margin-left: auto; background: none; border: none; color: var(--muted); cursor: pointer;
+    font-size: 12px; padding: 2px 5px; line-height: 1; border-radius: 4px; flex: none;
+  }
+  .collapse-toggle:hover { background: color-mix(in srgb, var(--text) 10%, transparent); color: var(--text); }
+  .collapse-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .panel.collapsed > *:not(h2), .col.collapsed > *:not(h2) { display: none; }
   .newcount {
     background: var(--accent); color: #fff; border-radius: 999px;
     padding: 0 7px; font-size: 10.5px; font-weight: 700;
@@ -277,19 +290,31 @@
   </div>
   <div>
     <div class="panel" id="presencePanel">
-      <h2>Presence</h2>
+      <h2>Presence
+        <button type="button" class="collapse-toggle" data-section-id="panel:presence" data-section-label="Presence"
+                aria-controls="presencePanel" aria-expanded="true" aria-label="Collapse Presence">&#9662;</button>
+      </h2>
       <div id="presence"></div>
     </div>
     <div class="panel" id="notesPanel">
-      <h2 class="clickable" id="notesHeader">Shared notes <span class="newcount" id="notesNew" style="display:none;"></span></h2>
+      <h2 class="clickable" id="notesHeader">Shared notes <span class="newcount" id="notesNew" style="display:none;"></span>
+        <button type="button" class="collapse-toggle" data-section-id="panel:notes" data-section-label="Shared notes"
+                aria-controls="notesPanel" aria-expanded="true" aria-label="Collapse Shared notes">&#9662;</button>
+      </h2>
       <div id="notes"></div>
     </div>
     <div class="panel chat-panel" id="chatPanel" style="display:none;">
-      <h2 class="clickable" id="chatHeader">Live chat <span class="chat-status" id="chatStatus"></span> <span class="newcount" id="chatNew" style="display:none;"></span></h2>
+      <h2 class="clickable" id="chatHeader">Live chat <span class="chat-status" id="chatStatus"></span> <span class="newcount" id="chatNew" style="display:none;"></span>
+        <button type="button" class="collapse-toggle" data-section-id="panel:chat" data-section-label="Live chat"
+                aria-controls="chatPanel" aria-expanded="true" aria-label="Collapse Live chat">&#9662;</button>
+      </h2>
       <div class="chat-log" id="chatLog"></div>
     </div>
     <div class="panel" id="historyPanel">
-      <h2>Chat history</h2>
+      <h2>Chat history
+        <button type="button" class="collapse-toggle" data-section-id="panel:history" data-section-label="Chat history"
+                aria-controls="historyPanel" aria-expanded="true" aria-label="Collapse Chat history">&#9662;</button>
+      </h2>
       <div id="historyList"></div>
       <button class="loadmore" id="historyLoadMore" style="display:none;">Load more</button>
     </div>
@@ -346,6 +371,98 @@ let newCounts = { tasks: 0, notes: 0, chat: 0 };
 // rendered disabled so a mid-flight renderBoard() (triggered by an unrelated
 // event) can't offer a second click on the same request.
 let pendingChecklistOps = new Set();
+
+// --- collapsible sections (board columns + sidebar panels) ----------------
+// Persisted as a JSON array of section ids under one localStorage key,
+// validated against a fixed allowlist on every load -- a stale id from an
+// older version of this allowlist, or foreign data in the same key, is
+// silently dropped rather than trusted (OpenClaw's review). "Done" is
+// included even though that column only appears once a task is actually
+// done, so a collapse preference set before any task reached "done" still
+// applies the first time the column shows up.
+const COLLAPSE_STORAGE_KEY = "collabhub.collapsed.v1";
+const COLLAPSIBLE_ALLOWLIST = new Set([
+  "column:open", "column:claimed", "column:in_progress", "column:blocked", "column:done",
+  "panel:presence", "panel:notes", "panel:chat", "panel:history",
+]);
+
+function loadCollapsedSections() {
+  try {
+    const raw = localStorage.getItem(COLLAPSE_STORAGE_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter(id => COLLAPSIBLE_ALLOWLIST.has(id)));
+  } catch {
+    // Corrupt JSON, a SecurityError from disabled/private-mode storage, or
+    // anything else localStorage/JSON can throw -- fall back to "nothing
+    // collapsed" so a bad persisted value can never break the dashboard.
+    return new Set();
+  }
+}
+function saveCollapsedSections() {
+  try {
+    localStorage.setItem(COLLAPSE_STORAGE_KEY, JSON.stringify([...collapsedSections]));
+  } catch {
+    // Quota exceeded / private mode / disabled storage -- the preference
+    // just won't survive a reload; not worth surfacing for a display-only
+    // setting.
+  }
+}
+let collapsedSections = loadCollapsedSections();
+
+// Reflects `collapsedSections` onto the DOM for one section id: toggles the
+// "collapsed" class on its container (.panel or .col -- CSS hides everything
+// in it except the h2) and keeps aria-expanded/label/glyph in sync on every
+// element carrying that data-section-id. Works uniformly for the four static
+// sidebar panels AND the dynamically-regenerated board columns, since it's a
+// live DOM query, not something baked into a render template.
+function applySectionCollapse(sectionId) {
+  const collapsed = collapsedSections.has(sectionId);
+  document.querySelectorAll(`.collapse-toggle[data-section-id="${sectionId}"]`).forEach(btn => {
+    const container = btn.closest(".panel, .col");
+    if (container) container.classList.toggle("collapsed", collapsed);
+    btn.setAttribute("aria-expanded", String(!collapsed));
+    btn.setAttribute("aria-label", `${collapsed ? "Expand" : "Collapse"} ${btn.dataset.sectionLabel || ""}`.trim());
+    btn.innerHTML = collapsed ? "&#9656;" : "&#9662;";
+  });
+}
+function applyAllCollapseState() {
+  for (const id of COLLAPSIBLE_ALLOWLIST) applySectionCollapse(id);
+}
+function toggleSection(sectionId) {
+  if (!COLLAPSIBLE_ALLOWLIST.has(sectionId)) return;
+  if (collapsedSections.has(sectionId)) collapsedSections.delete(sectionId);
+  else collapsedSections.add(sectionId);
+  saveCollapsedSections();
+  applySectionCollapse(sectionId);
+}
+// Expand a section unconditionally (used by search/deep-link navigation so
+// the destination is never left hidden) and persist that expansion so it
+// stays visible, not just for this one scroll.
+function ensureSectionExpanded(sectionId) {
+  if (!collapsedSections.has(sectionId)) return;
+  collapsedSections.delete(sectionId);
+  saveCollapsedSections();
+  applySectionCollapse(sectionId);
+}
+// One delegated listener handles every collapse toggle, static or
+// regenerated -- stopPropagation matters here: notesHeader/chatHeader also
+// have their own click listener that clears the "N new" badge, and merely
+// collapsing/expanding must NOT clear it (OpenClaw's review).
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest(".collapse-toggle");
+  if (!btn) return;
+  e.stopPropagation();
+  toggleSection(btn.dataset.sectionId);
+});
+// Cross-tab sync: the "storage" event fires in OTHER tabs/windows when this
+// key changes, never in the tab that made the write.
+window.addEventListener("storage", (e) => {
+  if (e.key !== COLLAPSE_STORAGE_KEY) return;
+  collapsedSections = loadCollapsedSections();
+  applyAllCollapseState();
+});
 
 function fmtTime(iso) {
   try {
@@ -431,12 +548,18 @@ function taskCard(t) {
 function renderBoard() {
   const board = document.getElementById("board");
   // Preserve focus across the full innerHTML replacement below -- otherwise
-  // every checklist checkbox/delete click (which triggers a renderBoard())
-  // drops keyboard focus back to <body>, breaking keyboard-only use.
+  // every checklist checkbox/delete click, or a live event landing while a
+  // column's collapse toggle is focused, drops keyboard focus back to
+  // <body>, breaking keyboard-only use (OpenClaw's review, both tranches).
   const active = document.activeElement;
-  const restore = (active && board.contains(active) && active.dataset.taskId && active.dataset.itemId)
-    ? { tag: active.tagName.toLowerCase(), taskId: active.dataset.taskId, itemId: active.dataset.itemId }
-    : null;
+  let restore = null;
+  if (active && board.contains(active)) {
+    if (active.dataset.taskId && active.dataset.itemId) {
+      restore = { type: "checklist", tag: active.tagName.toLowerCase(), taskId: active.dataset.taskId, itemId: active.dataset.itemId };
+    } else if (active.classList.contains("collapse-toggle") && active.dataset.sectionId) {
+      restore = { type: "collapse-toggle", sectionId: active.dataset.sectionId };
+    }
+  }
 
   const tasks = [...tasksById.values()].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
   const groups = { open: [], claimed: [], in_progress: [], blocked: [], done: [] };
@@ -446,15 +569,26 @@ function renderBoard() {
   if (groups.done.length) cols.push(["done", "Done"]);
 
   board.innerHTML = cols.map(([key, label]) => `
-    <div class="col">
-      <h2>${label} <span class="count">${groups[key].length}</span></h2>
+    <div class="col" id="col-${key}">
+      <h2>${label} <span class="count">${groups[key].length}</span>
+        <button type="button" class="collapse-toggle" data-section-id="column:${key}" data-section-label="${esc(label)} column"
+                aria-controls="col-${key}" aria-expanded="true" aria-label="Collapse ${esc(label)} column">&#9662;</button>
+      </h2>
       ${groups[key].length ? groups[key].map(taskCard).join("") : `<div class="empty">nothing here</div>`}
     </div>
   `).join("");
   renderNewCount("tasks");
+  // Re-apply persisted collapse state -- the template above always renders
+  // "expanded" markup; this is the one place that reconciles it against
+  // collapsedSections, so board regeneration never silently resets a
+  // column back open.
+  applyAllCollapseState();
 
   if (restore) {
-    const el = board.querySelector(`${restore.tag}[data-task-id="${restore.taskId}"][data-item-id="${restore.itemId}"]`);
+    const sel = restore.type === "checklist"
+      ? `${restore.tag}[data-task-id="${restore.taskId}"][data-item-id="${restore.itemId}"]`
+      : `.collapse-toggle[data-section-id="${restore.sectionId}"]`;
+    const el = board.querySelector(sel);
     if (el) el.focus();
   }
 }
@@ -562,6 +696,12 @@ function renderChat() {
   const panel = document.getElementById("chatPanel");
   if (!activeSession) { panel.style.display = "none"; return; }
   panel.style.display = "";
+  // "No active chat" (structural, style.display) and "collapsed by user
+  // preference" (the .collapsed class from applySectionCollapse) are
+  // deliberately independent -- a newly-started session must reappear
+  // honoring whatever collapse state was last chosen for it, never forced
+  // back open just because it structurally exists again (OpenClaw's review).
+  applySectionCollapse("panel:chat");
 
   const statusEl = document.getElementById("chatStatus");
   statusEl.textContent = activeSession.status;
@@ -1576,6 +1716,12 @@ async function scrollAndHighlightTask(taskId, matchedCommentId) {
       if (matchedCommentId != null) matchedComment = (t.comments || []).find(c => c.id === matchedCommentId) || null;
     }
   }
+  // A search/deep-link destination must never land inside a collapsed
+  // column -- expand it (and persist that) before the scroll below, since a
+  // display:none ancestor has no layout box to scroll into view at all
+  // (OpenClaw's review).
+  const destTask = tasksById.get(taskId);
+  if (destTask) ensureSectionExpanded(`column:${destTask.status}`);
   requestAnimationFrame(() => {
     const el = document.querySelector(`#board .card[data-task-id="${taskId}"]`);
     if (!el) return;
@@ -1593,6 +1739,7 @@ async function scrollAndHighlightTask(taskId, matchedCommentId) {
 }
 
 async function scrollAndHighlightNote(noteId) {
+  ensureSectionExpanded("panel:notes");
   if (!notesById.has(noteId)) {
     // Exact-id fetch -- list_notes only returns the newest slice, so an
     // older indexed note needs its own lookup, not a generous-limit guess
@@ -1675,6 +1822,11 @@ window.addEventListener("popstate", () => {
   openTranscript(parseInt(sid, 10), false, null, mid != null ? parseInt(mid, 10) : null);
 });
 
+// Apply persisted collapse state to the four static sidebar panels before
+// any board event has a chance to render -- board columns get this for free
+// inside renderBoard() itself, but the static panels' toggle buttons/aria
+// need it set once up front too.
+applyAllCollapseState();
 connectSSE();
 fetchPresence();
 setInterval(fetchPresence, 15000);
