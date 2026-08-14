@@ -1,3 +1,4 @@
 starlette>=0.37
 uvicorn>=0.29
 mcp>=1.2,<2.0
+websockets>=13

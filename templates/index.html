@@ -86,6 +86,25 @@
   .note .head b { color: var(--text); }
   .note .text { font-size: 13px; white-space: pre-wrap; }
   time { font-variant-numeric: tabular-nums; }
+  .chat-panel { margin-top: 20px; }
+  .chat-panel h2 { display: flex; align-items: center; gap: 8px; }
+  .chat-status {
+    font-size: 10.5px; font-weight: 600; text-transform: none; letter-spacing: 0;
+    padding: 1px 8px; border-radius: 999px; color: #fff;
+  }
+  .chat-status.active { background: var(--done); }
+  .chat-status.ended { background: var(--muted); }
+  .chat-log { max-height: 420px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+  .msg { max-width: 90%; }
+  .msg .head { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+  .msg .head b { color: var(--accent); }
+  .msg .bubble {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 6px 10px; font-size: 13px; white-space: pre-wrap;
+  }
+  .msg.claude .head b { color: var(--accent); }
+  .msg.openclaw .head b { color: var(--claimed); }
+  .msg.openclaw .bubble { border-color: color-mix(in srgb, var(--claimed) 40%, var(--border)); }
 </style>
 </head>
 <body>
@@ -96,9 +115,15 @@
 </header>
 <main>
   <div class="board" id="board"></div>
-  <div class="notes-panel">
-    <h2>Shared notes</h2>
-    <div id="notes"></div>
+  <div>
+    <div class="notes-panel">
+      <h2>Shared notes</h2>
+      <div id="notes"></div>
+    </div>
+    <div class="notes-panel chat-panel" id="chatPanel" style="display:none;">
+      <h2>Live chat <span class="chat-status" id="chatStatus"></span></h2>
+      <div class="chat-log" id="chatLog"></div>
+    </div>
   </div>
 </main>
 <script>
@@ -167,7 +192,38 @@ async function refresh() {
           <div class="text">${esc(n.text)}</div>
         </div>`).join("")
     : `<div class="empty">no notes yet</div>`;
+
+  await refreshChat(data.latest_chat_session);
 }
+
+async function refreshChat(session) {
+  const panel = document.getElementById("chatPanel");
+  if (!session) { panel.style.display = "none"; return; }
+  panel.style.display = "";
+
+  const statusEl = document.getElementById("chatStatus");
+  statusEl.textContent = session.status;
+  statusEl.className = "chat-status " + session.status;
+
+  let data;
+  try {
+    const res = await fetch(`/api/chat/poll?session_id=${session.id}&since=0`, { cache: "no-store" });
+    data = await res.json();
+  } catch (e) { return; }
+
+  const log = document.getElementById("chatLog");
+  const wasAtBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 30;
+  const msgs = data.messages || [];
+  log.innerHTML = msgs.length
+    ? msgs.map(m => `
+        <div class="msg ${esc(m.author)}">
+          <div class="head"><b>${esc(m.author || "?")}</b> &middot; <time>${fmtTime(m.created_at)}</time></div>
+          <div class="bubble">${esc(m.text)}</div>
+        </div>`).join("")
+    : `<div class="empty">session started, no messages yet</div>`;
+  if (wasAtBottom) log.scrollTop = log.scrollHeight;
+}
+
 refresh();
 setInterval(refresh, 2000);
 </script>
