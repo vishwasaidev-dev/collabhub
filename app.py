@@ -715,6 +715,34 @@ async def task_attachments_list(request: Request) -> JSONResponse:
     return JSONResponse(storage.list_attachments(task_id))
 
 
+async def _write_upload_chunks(upload, part_path: Path) -> tuple[int, str]:
+    """Streams `upload` into `part_path` in fixed 64KB chunks, hashing as it
+    goes -- `total` is a running count of actual bytes written, never a
+    client-declared request header. Raises ValueError for a size-limit/empty-file violation
+    (the caller maps that to 400); a genuine disk/write failure raises
+    OSError and propagates as-is. Pulled into its own function specifically
+    so it's independently mockable in tests -- proving a mid-stream disk
+    failure (e.g. ENOSPC) cleans up correctly needs to inject a failure
+    partway through a real write, which an end-to-end assertion can't do
+    cleanly against the inline version this used to be (OpenClaw's
+    review)."""
+    hasher = hashlib.sha256()
+    total = 0
+    with open(part_path, "xb") as f:
+        while True:
+            chunk = await upload.read(64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > storage.MAX_ATTACHMENT_BYTES:
+                raise ValueError(f"attachment exceeds the {storage.MAX_ATTACHMENT_BYTES}-byte per-file limit")
+            hasher.update(chunk)
+            f.write(chunk)
+    if total == 0:
+        raise ValueError("uploaded file is empty")
+    return total, hasher.hexdigest()
+
+
 async def task_attachment_upload(request: Request) -> JSONResponse:
     task_id = int(request.path_params["task_id"])
     origin_error = _check_trusted_origin(request)
@@ -749,8 +777,8 @@ async def task_attachment_upload(request: Request) -> JSONResponse:
     part_path = storage.ATTACHMENT_DIR / f"{storage_name}.part"
     final_path = storage.attachment_path(storage_name)
 
-    hasher = hashlib.sha256()
     total = 0
+    digest = ""
     write_error: tuple[int, str] | None = None
     try:
         # 'xb' = exclusive create -- refuses to open if the (randomly named,
@@ -760,19 +788,10 @@ async def task_attachment_upload(request: Request) -> JSONResponse:
         # the full transfer is validated, so nothing can ever observe a
         # partially-written file under a name attachment_path() would
         # resolve to.
-        with open(part_path, "xb") as f:
-            while True:
-                chunk = await upload.read(64 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > storage.MAX_ATTACHMENT_BYTES:
-                    write_error = (400, f"attachment exceeds the {storage.MAX_ATTACHMENT_BYTES}-byte per-file limit")
-                    break
-                hasher.update(chunk)
-                f.write(chunk)
-        if write_error is None and total == 0:
-            write_error = (400, "uploaded file is empty")
+        try:
+            total, digest = await _write_upload_chunks(upload, part_path)
+        except ValueError as exc:
+            write_error = (400, str(exc))
         if write_error is None:
             # os.replace()/os.rename() both silently OVERWRITE an existing
             # destination on POSIX and Windows alike -- os.link() is the
@@ -789,7 +808,12 @@ async def task_attachment_upload(request: Request) -> JSONResponse:
             try:
                 os.link(part_path, final_path)
             except FileExistsError:
-                write_error = (500, "storage name collision -- please retry")
+                # 409 Conflict, not a generic 500 -- this is a well-understood,
+                # bounded condition (the storage allocation collided), not an
+                # unexpected server fault, and the client's own natural
+                # response (retry) is exactly what 409 signals (OpenClaw's
+                # review).
+                write_error = (409, "storage allocation conflict -- please retry")
             else:
                 part_path.unlink(missing_ok=True)
     except OSError:
@@ -809,7 +833,7 @@ async def task_attachment_upload(request: Request) -> JSONResponse:
     try:
         item = storage.create_attachment(
             task_id, original_filename, upload.content_type or "application/octet-stream",
-            total, hasher.hexdigest(), storage_name, uploaded_by,
+            total, digest, storage_name, uploaded_by,
         )
     except storage.NotFoundError as exc:
         final_path.unlink(missing_ok=True)
@@ -817,6 +841,18 @@ async def task_attachment_upload(request: Request) -> JSONResponse:
     except ValueError as exc:
         final_path.unlink(missing_ok=True)
         return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception:
+        # ANY other failure from create_attachment (a DB-layer exception we
+        # didn't anticipate, e.g. an event-emit failure inside its
+        # transaction) must still clean up the just-finalized file before
+        # propagating -- the two explicit except clauses above originally
+        # left this bare, so an unanticipated exception type would leave an
+        # orphaned file with no cleanup at all. Re-raised so Starlette's
+        # normal 500 handling still applies; only the cleanup is added here
+        # (OpenClaw's review: inject an event-write failure and prove
+        # rollback + cleanup, not just the two happy-path error types).
+        final_path.unlink(missing_ok=True)
+        raise
     return JSONResponse(item, status_code=201)
 
 

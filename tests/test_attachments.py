@@ -494,7 +494,9 @@ def test_no_content_length_trust_in_upload_handler() -> None:
     bytes exceed the limit)."""
     import inspect
     import app as app_module
-    source = inspect.getsource(app_module.task_attachment_upload)
+    # The actual byte-counting loop lives in _write_upload_chunks; check
+    # both it and the outer handler.
+    source = inspect.getsource(app_module.task_attachment_upload) + inspect.getsource(app_module._write_upload_chunks)
     assert "content-length" not in source.lower(), (
         "upload handler must never read Content-Length for its size decision -- only the streaming byte counter"
     )
@@ -538,7 +540,12 @@ def test_storage_name_collision_handled_safely() -> None:
         res1 = client.post(f"/api/tasks/{t['id']}/attachments", files={"file": ("first.txt", io.BytesIO(b"first content"), "text/plain")})
         assert res1.status_code == 201, res1.text
         res2 = client.post(f"/api/tasks/{t['id']}/attachments", files={"file": ("second.txt", io.BytesIO(b"second content"), "text/plain")})
-        assert res2.status_code != 201, "a storage_name collision must not silently succeed"
+        # A deliberate, bounded 409 Conflict -- not a generic 500 -- since
+        # this is a well-understood condition with an obvious client
+        # response (retry), not an unexpected server fault (OpenClaw's
+        # review).
+        assert res2.status_code == 409, res2.text
+        assert list(storage.ATTACHMENT_DIR.glob("*.part")) == [], "the second attempt's .part file must be cleaned up"
     finally:
         storage.generate_storage_name = original
         app_module.storage.generate_storage_name = original
@@ -627,6 +634,116 @@ def test_rest_head_and_range_preserve_security_headers() -> None:
     print("PASS: security headers (nosniff, attachment disposition, octet-stream) survive on both HEAD and 206 Range responses")
 
 
+def test_rest_delete_unlink_failure_leaves_recorded_orphan_not_resurrected_row() -> None:
+    """Missing bytes (tested above) is a proxy for a PAST failure, not
+    evidence that a failing unlink() call itself is handled correctly --
+    this forces Path.unlink to raise OSError for exactly this attachment's
+    file during the delete request, and confirms: the DB delete still
+    succeeds (removed:true, no phantom row resurrected), the file is left
+    physically in place (the unlink genuinely failed), and
+    reconcile_attachment_storage() picks it up as an orphan afterward
+    (OpenClaw's review)."""
+    _fresh_env()
+    client = _client()
+    t = client.post("/api/tasks", json={"title": "x", "created_by": "claude"}).json()
+    meta = client.post(f"/api/tasks/{t['id']}/attachments", files={"file": ("f.txt", io.BytesIO(b"x"), "text/plain")}).json()
+
+    from pathlib import Path as _Path
+    real_unlink = _Path.unlink
+
+    def failing_unlink(self, *a, **kw):
+        if self.name == meta["storage_name"]:
+            raise OSError("simulated unlink failure")
+        return real_unlink(self, *a, **kw)
+
+    _Path.unlink = failing_unlink
+    try:
+        res = client.delete(f"/api/tasks/{t['id']}/attachments/{meta['id']}")
+        assert res.status_code == 200 and res.json()["removed"] is True, "DB delete must succeed even though the unlink failed"
+    finally:
+        _Path.unlink = real_unlink
+
+    assert storage.list_attachments(t["id"]) == [], "the DB row must not be resurrected just because unlink failed"
+    assert storage.attachment_path(meta["storage_name"]).exists(), "the file is genuinely still there -- the unlink really failed"
+    report = storage.reconcile_attachment_storage()
+    assert meta["storage_name"] in report["removed_orphaned_files"], "reconciliation must catch and clean up the orphan afterward"
+    print("PASS: a failing unlink() after a successful DB delete leaves no phantom row; the orphan is caught by reconciliation, not lost")
+
+
+def test_event_write_failure_rolls_back_transaction_and_cleans_up_file() -> None:
+    """Injects a failure INSIDE create_attachment's own transaction (after
+    the file was already finalized on disk) -- the whole DB transaction
+    must roll back (no attachment row, task.updated_at unchanged), and the
+    broadened `except Exception` in the REST handler (fixed as part of this
+    same review round -- it previously only cleaned up on the two
+    anticipated exception types) must still unlink the finalized file
+    (OpenClaw's review)."""
+    _fresh_env()
+    from starlette.testclient import TestClient
+    import app as app_module
+    # raise_server_exceptions=False -- TestClient's default re-raises an
+    # unhandled server exception into the test process instead of turning
+    # it into the 500 response a real deployed server would actually send;
+    # this test wants to assert on that real response, not catch the raw
+    # exception itself.
+    client = TestClient(app_module.app, base_url="http://127.0.0.1", raise_server_exceptions=False)
+    t = client.post("/api/tasks", json={"title": "x", "created_by": "claude"}).json()
+    before_updated_at = t["updated_at"]
+
+    real_emit = storage._emit_event
+
+    def failing_emit(conn, type_, payload):
+        if type_ == "attachment_added":
+            raise RuntimeError("simulated event-write failure")
+        return real_emit(conn, type_, payload)
+
+    storage._emit_event = failing_emit
+    try:
+        res = client.post(f"/api/tasks/{t['id']}/attachments", files={"file": ("f.txt", io.BytesIO(b"x"), "text/plain")})
+        assert res.status_code == 500, res.text
+    finally:
+        storage._emit_event = real_emit
+
+    assert storage.list_attachments(t["id"]) == [], "the transaction must roll back -- no attachment row"
+    after = client.get(f"/api/tasks/{t['id']}").json()
+    assert after["updated_at"] == before_updated_at, "the task bump must roll back too -- same transaction"
+    assert list(storage.ATTACHMENT_DIR.iterdir()) == [], "the finalized file must still be cleaned up even though create_attachment raised an unanticipated exception type"
+    print("PASS: an event-write failure rolls back the whole DB transaction; the finalized file is still cleaned up")
+
+
+def test_mid_stream_write_failure_cleans_up_part_file() -> None:
+    """Simulates a disk-full (ENOSPC) failure partway through the streaming
+    write -- via the extracted _write_upload_chunks() function, which this
+    review round pulled out specifically to make this injectable -- and
+    confirms the partial .part file is cleaned up, with no final file or DB
+    row created (OpenClaw's review)."""
+    _fresh_env()
+    client = _client()
+    t = client.post("/api/tasks", json={"title": "x", "created_by": "claude"}).json()
+
+    import app as app_module
+    real_write = app_module._write_upload_chunks
+
+    async def failing_write(upload, part_path):
+        # Simulate a partial write reaching disk before the failure --
+        # exactly what a real ENOSPC mid-stream would leave behind if the
+        # caller's cleanup didn't remove it.
+        with open(part_path, "xb") as f:
+            f.write(b"partial-before-disk-full")
+        raise OSError(28, "No space left on device")  # 28 == errno.ENOSPC
+
+    app_module._write_upload_chunks = failing_write
+    try:
+        res = client.post(f"/api/tasks/{t['id']}/attachments", files={"file": ("big.bin", io.BytesIO(b"x" * 1000), "application/octet-stream")})
+        assert res.status_code == 500, res.text
+    finally:
+        app_module._write_upload_chunks = real_write
+
+    assert list(storage.ATTACHMENT_DIR.iterdir()) == [], "a mid-stream disk failure must leave no .part file behind"
+    assert storage.list_attachments(t["id"]) == []
+    print("PASS: a simulated ENOSPC mid-stream failure cleans up the partial .part file, no DB row created")
+
+
 if __name__ == "__main__":
     test_create_list_get_delete_attachment()
     test_attachment_task_membership_and_missing_task()
@@ -653,4 +770,7 @@ if __name__ == "__main__":
     test_rest_delete_succeeds_even_if_bytes_already_missing()
     test_rest_html_and_svg_always_forced_download_never_inline()
     test_rest_head_and_range_preserve_security_headers()
+    test_rest_delete_unlink_failure_leaves_recorded_orphan_not_resurrected_row()
+    test_event_write_failure_rolls_back_transaction_and_cleans_up_file()
+    test_mid_stream_write_failure_cleans_up_part_file()
     print("All attachment tests passed.")

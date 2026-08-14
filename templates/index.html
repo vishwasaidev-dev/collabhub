@@ -436,6 +436,18 @@ let checklistAddErrors = new Map();
 // visibly in the (disabled) input during the request instead of blanking it
 // prematurely.
 let checklistAddPending = new Map();
+// taskId -> filename currently uploading (busy state for the attachment form).
+let attachmentUploadPending = new Map();
+// taskId -> {file: File, message: string} for a failed upload -- keeps the
+// actual File object in memory (not just its name) so Retry re-attempts the
+// same upload without asking the user to re-pick the file (a file input's
+// value can never be set programmatically, so this is the only way to
+// offer a real retry -- OpenClaw's review).
+let attachmentUploadErrors = new Map();
+// "taskId:attachmentId" -> true while a delete request is in flight.
+let pendingAttachmentDeletes = new Set();
+// "taskId:attachmentId" -> error message for a failed delete.
+let attachmentDeleteErrors = new Map();
 
 // --- collapsible sections (board columns + sidebar panels) ----------------
 // Persisted as a JSON array of section ids under one localStorage key,
@@ -580,6 +592,11 @@ function isOverdue(ymd) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   return parseLocalDate(ymd).getTime() < today.getTime();
+}
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 // --- rendering (always derived from the Maps above) -------------------------
