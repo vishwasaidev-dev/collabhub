@@ -108,14 +108,18 @@
     flex: none; background: none; border: none; color: var(--muted); cursor: pointer;
     font-size: 13px; line-height: 1; padding: 0 2px; visibility: hidden;
   }
-  /* Reveal on :focus-within too, not just :hover -- visibility:hidden alone
-     makes the button unreachable by keyboard entirely, since a hidden
-     control can still be focused via Tab (visibility, unlike display, does
-     not remove it from the tab order) but was never visibly revealed when
-     that focus landed (OpenClaw's review). */
+  /* Reveal on :focus-within too, not just :hover. visibility:hidden actually
+     REMOVES an element from Tab's sequential focus order -- it was never
+     reachable by keyboard at all before this. The fix works because Tab
+     first lands on the (always-visible) checkbox, which triggers
+     :focus-within on the shared .checklist-item row and reveals the delete
+     button just before the NEXT Tab press would need to reach it
+     (corrected per OpenClaw's review -- the original comment here wrongly
+     claimed visibility:hidden controls stay tabbable). */
   .checklist-item:hover .item-delete, .checklist-item:focus-within .item-delete { visibility: visible; }
   .checklist-item .item-delete:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   .checklist-item .item-delete[aria-disabled="true"] { opacity: .5; cursor: default; }
+  .item-error-msg { font-size: 11px; color: var(--blocked); flex: none; }
   .item-retry {
     flex: none; font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--blocked);
     background: none; color: var(--blocked); cursor: pointer;
@@ -388,6 +392,23 @@ let notesById = new Map();
 let chatMessagesById = new Map();
 let presenceByAgent = new Map();
 let activeSession = null;   // {id, status, started_by, ...} | null
+// Persisted "was the user scrolled to the bottom of the chat log" intent --
+// NOT recomputed from the DOM while #chatLog is hidden (collapsed), since a
+// hidden element's scroll metrics are meaningless. Lets an expand action
+// correctly reveal the newest message when messages arrived while
+// collapsed, without disturbing someone who was intentionally scrolled up
+// reading older messages (OpenClaw's review).
+//
+// Updating this ONLY inside renderChat() was still wrong: a manual scroll
+// (no render involved at all) left it stale -- scroll to bottom (true) ->
+// scroll up to read old messages (nothing re-renders, flag stays true) ->
+// collapse -> a message arrives -> expand forces scrollTop back to the
+// bottom, discarding the read position (OpenClaw's second catch on this
+// same fix). A live "scroll" listener on the always-present #chatLog
+// element closes that gap -- scroll events only fire while an element has
+// real layout, so there's no hidden-element false-read risk here the way
+// there was reading scrollHeight/clientHeight inside renderChat().
+let chatAtBottom = true;
 let lastAppliedEventId = 0; // dedupe/idempotency gate -- ignore event.id <= this
 // True while a gap is open below lastAppliedEventId that a resync hasn't yet
 // closed (a task fetch failed AND the recovery resync itself also failed).
@@ -484,6 +505,15 @@ function toggleSection(sectionId) {
   else collapsedSections.add(sectionId);
   saveCollapsedSections();
   applySectionCollapse(sectionId);
+  if (sectionId === "panel:chat" && !collapsedSections.has(sectionId) && chatAtBottom) {
+    // Live chat just expanded and the last known intent was "at the
+    // bottom" -- #chatLog had no real layout box to scroll while hidden, so
+    // this is the first point where setting scrollTop can actually take
+    // effect (OpenClaw's review: messages arriving while collapsed must
+    // still be revealed on expand).
+    const log = document.getElementById("chatLog");
+    if (log) log.scrollTop = log.scrollHeight;
+  }
 }
 // Expand a section unconditionally (used by search/deep-link navigation so
 // the destination is never left hidden) and persist that expansion so it
@@ -578,7 +608,8 @@ function checklistHtml(t) {
         <input type="checkbox" ${it.done ? "checked" : ""} ${busy ? 'aria-disabled="true"' : ""}
                data-task-id="${t.id}" data-item-id="${it.id}" aria-label="${esc(it.text)}">
         <span class="item-text ${it.done ? "done" : ""}">${esc(it.text)}</span>
-        ${err ? `<button type="button" class="item-retry" data-task-id="${t.id}" data-item-id="${it.id}"
+        ${err ? `<span class="item-error-msg" role="alert">${err.action === "delete" ? "Delete failed." : "Update failed."}</span>
+                 <button type="button" class="item-retry" data-task-id="${t.id}" data-item-id="${it.id}"
                          data-action="${err.action}" data-desired-done="${err.desiredDone ? "1" : "0"}">Retry</button>` : ""}
         <button type="button" class="item-delete" data-task-id="${t.id}" data-item-id="${it.id}"
                 ${busy ? 'aria-disabled="true"' : ""} aria-label="Delete checklist item: ${esc(it.text)}">&times;</button>
@@ -598,7 +629,7 @@ function checklistHtml(t) {
         : `<form class="checklist-add" data-task-id="${t.id}">
              <input type="text" maxlength="300" placeholder="Add checklist item…"
                     aria-label="New checklist item for task #${t.id}" value="${esc(inputValue)}"
-                    ${addBusy ? 'aria-disabled="true"' : ""}>
+                    ${addBusy ? 'readonly aria-disabled="true"' : ""}>
              <button type="submit" ${addBusy ? 'aria-disabled="true"' : ""}>Add</button>
            </form>
            ${addErr ? `<div class="checklist-add-error">${esc(addErr.message)}</div>` : ""}`}
@@ -632,8 +663,16 @@ function renderBoard() {
   const active = document.activeElement;
   let restore = null;
   if (active && board.contains(active)) {
+    const addForm = active.closest(".checklist-add");
     if (active.dataset.taskId && active.dataset.itemId) {
       restore = { type: "checklist", tag: active.tagName.toLowerCase(), taskId: active.dataset.taskId, itemId: active.dataset.itemId };
+    } else if (addForm) {
+      // The add input/button carry no data-task-id of their own (only the
+      // <form> does) -- without this branch, focus on either one was simply
+      // never preserved at all, including the specific case OpenClaw asked
+      // for: a failed add should return focus to its own input so the
+      // retained text + inline error are immediately actionable.
+      restore = { type: "checklist-add", tag: active.tagName.toLowerCase(), taskId: addForm.dataset.taskId };
     } else if (active.classList.contains("collapse-toggle") && active.dataset.sectionId) {
       restore = { type: "collapse-toggle", sectionId: active.dataset.sectionId };
     }
@@ -668,6 +707,12 @@ function renderBoard() {
     let el = null;
     if (restore.type === "checklist") {
       el = board.querySelector(`${restore.tag}[data-task-id="${restore.taskId}"][data-item-id="${restore.itemId}"]`);
+    } else if (restore.type === "checklist-add") {
+      const form = board.querySelector(`.checklist-add[data-task-id="${restore.taskId}"]`);
+      el = form ? form.querySelector(restore.tag) : null;
+      // The add form disappears entirely once the item-count cap is hit --
+      // nothing meaningful to restore focus to in that case, same as a
+      // deleted checklist item.
     } else if (restore.type === "collapse-toggle") {
       el = board.querySelector(`.collapse-toggle[data-section-id="${restore.sectionId}"]`);
       if (!el) {
@@ -833,6 +878,18 @@ function renderChat() {
   const panel = document.getElementById("chatPanel");
   if (!activeSession) { panel.style.display = "none"; return; }
   panel.style.display = "";
+
+  const log = document.getElementById("chatLog");
+  // Read the real scroll position ONLY while the log is actually visible --
+  // scrollHeight/scrollTop/clientHeight all read as 0 on a hidden element,
+  // which would silently overwrite a genuine "user was at the bottom"
+  // intent with a false one the instant the panel gets collapsed. While
+  // hidden, chatAtBottom simply keeps whatever it was last set to
+  // (OpenClaw's review).
+  if (!log.hidden) {
+    chatAtBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 30;
+  }
+
   // "No active chat" (structural, style.display on the whole panel) and
   // "collapsed by user preference" (the hidden attribute on #chatLog alone,
   // from applySectionCollapse) are deliberately independent -- a
@@ -845,8 +902,6 @@ function renderChat() {
   statusEl.textContent = activeSession.status;
   statusEl.className = "chat-status " + activeSession.status;
 
-  const log = document.getElementById("chatLog");
-  const wasAtBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 30;
   const msgs = [...chatMessagesById.values()].sort((a, b) => a.id - b.id);
   log.innerHTML = msgs.length
     ? msgs.map(m => `
@@ -855,7 +910,11 @@ function renderChat() {
           <div class="bubble">${esc(m.text)}</div>
         </div>`).join("")
     : `<div class="empty">session started, no messages yet</div>`;
-  if (wasAtBottom) log.scrollTop = log.scrollHeight;
+  // Meaningless while hidden (no layout box to scroll) -- but harmless to
+  // attempt, and correct for the common "visible and at bottom" case. The
+  // collapsed-then-expanded case is handled separately in toggleSection(),
+  // since scrollTop can only take effect once the element has real layout.
+  if (chatAtBottom) log.scrollTop = log.scrollHeight;
   renderNewCount("chat");
 }
 
@@ -1270,6 +1329,15 @@ document.getElementById("notesHeader").addEventListener("click", (e) => {
 document.getElementById("chatHeader").addEventListener("click", (e) => {
   if (e.target.closest(".collapse-toggle")) return;
   newCounts.chat = 0; renderNewCount("chat");
+});
+// Keeps chatAtBottom accurate for a manual scroll that happens with no
+// render in between (e.g. scrolling up to read older messages, then
+// collapsing without any new message arriving first) -- renderChat() alone
+// only saw the DOM at its own call times, missing exactly that case
+// (OpenClaw's review).
+document.getElementById("chatLog").addEventListener("scroll", () => {
+  const log = document.getElementById("chatLog");
+  chatAtBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 30;
 });
 
 // ---------------------------------------------------------------------------
