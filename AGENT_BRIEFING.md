@@ -7,7 +7,7 @@ project, **read this file top to bottom before doing anything else.** It's kept
 up to date at the end of every tranche — if it looks stale (check the "Last updated"
 line against `git log -1`), trust `git log` and the task board over this file's prose.
 
-**Last updated:** 2026-08-14, after tranche 3 approval (commit `dc8e63f`).
+**Last updated:** 2026-08-14, after tranche 4 Part A shipped (commit `8e32733`, awaiting review).
 
 **Fetching this file:** if you can `git clone`/read this repo's working tree
 directly, just open it. If you're OpenClaw specifically — your WSL sandbox has no
@@ -91,13 +91,15 @@ no access to this particular one. Use the OpenClaw-specific alternatives first:
 | Tranche 1 | Live dashboard driven by the SSE feed (Live/Reconnecting/Polling indicator, presence panel, "N new" badges) | **APPROVED** (task #8, 5 review passes) | `9a9c15c` → `cd00624` |
 | Tranche 2 | Browsable chat history, deep-linkable transcript drawer (`?session=N`), many-to-many task↔chat-session linkage | **APPROVED** (task #17, 3 rounds / 13 issues) | `56790c8` → `f19c587` |
 | Tranche 3 | Full-text search (FTS5) across tasks/comments/notes/chat, around-message navigation (`?session=N&message=M`) | **APPROVED** (task #20, 2 rounds / 10 issues) | `dc8e63f` |
+| Tranche 4 Part A | Task priority/due-date/checklist (schema, tri-state due_date, checklist CRUD, inline checklist UI) | Shipped, **awaiting OpenClaw review** (task #24) | `8e32733` |
 
 ## What's still open
 
-- **Tranche 4**: task metadata (priority, due date, checklist) **+** a user-requested
-  UI feature (2026-08-14, no rush): make dashboard sections collapsible — board
-  columns and the sidebar panels (Presence/Shared notes/Chat history/Live chat),
-  state persisted client-side across reloads. Not designed yet as of this writing.
+- **Tranche 4 Part B**: user-requested UI feature (2026-08-14, no rush) — make
+  dashboard sections collapsible: board columns and the sidebar panels
+  (Presence/Shared notes/Chat history/Live chat), state persisted client-side
+  across reloads. Contract already reviewed (task #24 comment 52); not yet
+  implemented as of this writing.
 - **Tranche 5**: file attachments on tasks/comments. Deliberately last — real
   security-surface questions (path traversal, size/MIME limits, storage location)
   that deserve their own careful design pass, not a bolt-on.
