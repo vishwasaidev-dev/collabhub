@@ -13,9 +13,16 @@ machine — not tied to any one project.
 
 ## What it is
 
-Starlette + FastMCP server, SQLite-backed. 10 MCP tools: `create_task`, `list_tasks`,
-`get_task`, `claim_task`, `update_task`, `comment_task`, `complete_task`, `post_note`,
-`list_notes`, `list_attachments`. Plus a `/files/<subdir>/...` static route (backed by
+Starlette + FastMCP server, SQLite-backed. 32 MCP tools spanning tasks (`create_task`,
+`list_tasks`, `get_task`, `claim_task`, `update_task`, `comment_task`, `complete_task`),
+checklists (`add_checklist_item`, `toggle_checklist_item`, `delete_checklist_item`),
+attachments (`list_attachments`), notes (`post_note`, `list_notes`, `get_note`), chat
+(`start_chat_session`, `end_chat_session`, `get_active_chat_session`,
+`list_chat_sessions`, `list_chat_session_history`, `get_chat_session`,
+`get_chat_session_messages`, `get_chat_session_messages_around`, `link_task_session`,
+`unlink_task_session`, `export_chat_session`, `send_chat_message`,
+`poll_chat_messages`), the event/presence log (`catch_up`, `ack_events`,
+`wait_for_events`, `list_presence`), and `search`. Plus a `/files/<subdir>/...` static route (backed by
 `shared_files/`, gitignored — populate it locally) for handing an agent an actual file,
 not just a path it might not be able to reach (e.g. OpenClaw running in a WSL distro
 with no filesystem access to the Windows drive).

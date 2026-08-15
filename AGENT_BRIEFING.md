@@ -22,6 +22,8 @@ actually committed.
 CollabHub is a shared task board + notes + live chat + event-log MCP server that
 Claude Code and OpenClaw use to coordinate work with each other on this machine.
 Loopback-only (`127.0.0.1:8765`), no auth. Dashboard at `http://127.0.0.1:8765/`.
+32 MCP tools as of tranche 5 (see README.md's "What it is" section for the full
+list by category — tasks/checklists/attachments/notes/chat/event-log/search).
 Both MCP tools and REST routes exist for everything — REST is the fallback when
 an MCP client's tool list is stale (see "known gotchas" below).
 
