@@ -442,6 +442,7 @@ def catch_up(agent: str, after_cursor: int | None = None) -> dict:
         my_tasks = [_task_row_to_dict(r) for r in my_tasks_rows]
         _hydrate_checklists(conn, my_tasks)
         _hydrate_attachments(conn, my_tasks)
+        _hydrate_comments(conn, my_tasks)
         active_chat = conn.execute(
             "SELECT * FROM chat_sessions WHERE status='active' ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -539,6 +540,29 @@ def _hydrate_attachments(conn: sqlite3.Connection, tasks: list[dict]) -> None:
         t["attachments"] = by_task.get(t["id"], [])
 
 
+def _hydrate_comments(conn: sqlite3.Connection, tasks: list[dict]) -> None:
+    """Batched (no N+1), same pattern as _hydrate_checklists/_hydrate_attachments
+    -- every task-list shape gets comments, not just get_task (which used to
+    fetch them inline, one-off; the dashboard's initial /api/state load showed
+    no comments at all until a task happened to get a live event and trigger
+    an individual get_task refetch -- the exact gap _hydrate_checklists'
+    docstring already warns about, just for a field that hadn't been given
+    the same treatment yet)."""
+    if not tasks:
+        return
+    task_ids = [t["id"] for t in tasks]
+    placeholders = ",".join("?" * len(task_ids))
+    rows = conn.execute(
+        f"SELECT * FROM comments WHERE task_id IN ({placeholders}) ORDER BY task_id, created_at ASC, id ASC",
+        task_ids,
+    ).fetchall()
+    by_task: dict[int, list[dict]] = {}
+    for r in rows:
+        by_task.setdefault(r["task_id"], []).append(dict(r))
+    for t in tasks:
+        t["comments"] = by_task.get(t["id"], [])
+
+
 def create_task(
     title: str, description: str = "", created_by: str = "", tags: list[str] | None = None,
     priority: str = "normal", due_date: str | None = None,
@@ -584,6 +608,7 @@ def list_tasks(status: str | None = None, assignee: str | None = None) -> list[d
         tasks = [_task_row_to_dict(r) for r in rows]
         _hydrate_checklists(conn, tasks)
         _hydrate_attachments(conn, tasks)
+        _hydrate_comments(conn, tasks)
         return tasks
 
 
@@ -593,16 +618,13 @@ def get_task(task_id: int) -> dict | None:
         if not row:
             return None
         task = _task_row_to_dict(row)
-        comment_rows = conn.execute(
-            "SELECT * FROM comments WHERE task_id=? ORDER BY created_at ASC", (task_id,)
-        ).fetchall()
-        task["comments"] = [dict(r) for r in comment_rows]
         # Non-recursive summaries only -- a session here doesn't itself embed
         # its messages/other linked tasks (OpenClaw's review: avoid recursive
         # full objects).
         task["chat_sessions"] = _task_chat_session_summaries(conn, task_id)
         _hydrate_checklists(conn, [task])
         _hydrate_attachments(conn, [task])
+        _hydrate_comments(conn, [task])
         return task
 
 
@@ -650,6 +672,7 @@ def update_task(
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         task = _task_row_to_dict(row)
         _hydrate_checklists(conn, [task])
+        _hydrate_comments(conn, [task])
         _emit_event(conn, "task_updated", {"task_id": task_id, "status": task["status"], "assignee": task.get("assignee")})
         if assignee:
             _touch_presence(conn, assignee, "update_task")
@@ -1675,6 +1698,7 @@ def full_state() -> dict:
         tasks = [_task_row_to_dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY updated_at DESC").fetchall()]
         _hydrate_checklists(conn, tasks)
         _hydrate_attachments(conn, tasks)
+        _hydrate_comments(conn, tasks)
         notes = [dict(r) for r in conn.execute("SELECT * FROM notes ORDER BY created_at DESC LIMIT 100").fetchall()]
         active_chat_row = conn.execute(
             "SELECT * FROM chat_sessions WHERE status='active' ORDER BY id DESC LIMIT 1"

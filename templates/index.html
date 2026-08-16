@@ -141,6 +141,23 @@
   .checklist-add button[aria-disabled="true"] { opacity: .6; cursor: default; }
   .checklist-add-error { font-size: 11px; color: var(--blocked); margin-top: 4px; }
   .checklist-limit { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .comments { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 6px; }
+  .comment-list { max-height: 200px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .comment-item { font-size: 12.5px; }
+  .comment-item .chead { color: var(--muted); font-size: 11px; margin-bottom: 1px; }
+  .comment-item .chead b { color: var(--text); }
+  .comment-item .ctext { white-space: pre-wrap; }
+  .comment-add { display: flex; gap: 4px; margin-top: 6px; }
+  .comment-add input {
+    flex: 1; font-size: 12px; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text);
+  }
+  .comment-add button {
+    font-size: 12px; padding: 3px 8px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); cursor: pointer;
+  }
+  .comment-add button[aria-disabled="true"] { opacity: .6; cursor: default; }
+  .comment-add-error { font-size: 11px; color: var(--blocked); margin-top: 4px; }
   .attachments { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 6px; }
   .attachment-list { max-height: 140px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
   .attachment-item {
@@ -567,6 +584,10 @@ let attachmentUploadErrors = new Map();
 let pendingAttachmentDeletes = new Set();
 // "taskId:attachmentId" -> error message for a failed delete.
 let attachmentDeleteErrors = new Map();
+// taskId -> comment text currently being submitted (same pending/error/retain-
+// on-failure shape as checklistAddPending/checklistAddErrors above).
+let commentAddPending = new Map();
+let commentAddErrors = new Map();
 
 // --- collapsible sections (board columns + sidebar panels) ----------------
 // Persisted as a JSON array of section ids under one localStorage key,
@@ -810,6 +831,35 @@ function attachmentsHtml(t) {
     </div>`;
 }
 
+// Comments used to exist only in the data (get_task/full_state hydrate them,
+// task_commented already flows through the live-event pipeline the same as
+// task_updated) but were never rendered anywhere on the board -- the only way
+// to see one was the raw API or a lucky search hit. This is purely the
+// missing display + a composer, same shape as the checklist add form.
+function commentsHtml(t) {
+  const comments = t.comments || [];
+  const itemsHtml = comments.map(c => `
+      <div class="comment-item">
+        <div class="chead"><b>${esc(c.author || "?")}</b> &middot; <time>${fmtTime(c.created_at)}</time></div>
+        <div class="ctext">${esc(c.text)}</div>
+      </div>`).join("");
+  const err = commentAddErrors.get(t.id);
+  const pendingText = commentAddPending.get(t.id);
+  const addBusy = pendingText !== undefined;
+  const inputValue = addBusy ? pendingText : (err ? err.text : "");
+  return `
+    <div class="comments">
+      ${comments.length ? `<div class="comment-list">${itemsHtml}</div>` : ""}
+      <form class="comment-add" data-task-id="${t.id}">
+        <input type="text" maxlength="4000" placeholder="Add a comment…"
+               aria-label="New comment on task #${t.id}" value="${esc(inputValue)}"
+               ${addBusy ? 'readonly aria-disabled="true"' : ""}>
+        <button type="submit" ${addBusy ? 'aria-disabled="true"' : ""}>Comment</button>
+      </form>
+      ${err ? `<div class="comment-add-error">${esc(err.message)}</div>` : ""}
+    </div>`;
+}
+
 function taskCard(t) {
   const overdue = t.due_date && t.status !== "done" && isOverdue(t.due_date);
   return `
@@ -826,6 +876,7 @@ function taskCard(t) {
       </div>
       ${checklistHtml(t)}
       ${attachmentsHtml(t)}
+      ${commentsHtml(t)}
     </div>`;
 }
 
@@ -840,6 +891,7 @@ function renderBoard() {
   if (active && board.contains(active)) {
     const checklistAddForm = active.closest(".checklist-add");
     const attachmentAddForm = active.closest(".attachment-add");
+    const commentAddForm = active.closest(".comment-add");
     if (active.dataset.taskId && active.dataset.itemId) {
       restore = { type: "checklist", tag: active.tagName.toLowerCase(), taskId: active.dataset.taskId, itemId: active.dataset.itemId };
     } else if (active.dataset.taskId && active.dataset.attachmentId) {
@@ -853,6 +905,8 @@ function renderBoard() {
       restore = { type: "checklist-add", tag: active.tagName.toLowerCase(), taskId: checklistAddForm.dataset.taskId };
     } else if (attachmentAddForm) {
       restore = { type: "attachment-add", tag: active.tagName.toLowerCase(), taskId: attachmentAddForm.dataset.taskId };
+    } else if (commentAddForm) {
+      restore = { type: "comment-add", tag: active.tagName.toLowerCase(), taskId: commentAddForm.dataset.taskId };
     } else if (active.classList.contains("collapse-toggle") && active.dataset.sectionId) {
       restore = { type: "collapse-toggle", sectionId: active.dataset.sectionId };
     }
@@ -899,6 +953,9 @@ function renderBoard() {
       // deleted checklist item.
     } else if (restore.type === "attachment-add") {
       const form = board.querySelector(`.attachment-add[data-task-id="${restore.taskId}"]`);
+      el = form ? form.querySelector(restore.tag) : null;
+    } else if (restore.type === "comment-add") {
+      const form = board.querySelector(`.comment-add[data-task-id="${restore.taskId}"]`);
       el = form ? form.querySelector(restore.tag) : null;
     } else if (restore.type === "collapse-toggle") {
       el = board.querySelector(`.collapse-toggle[data-section-id="${restore.sectionId}"]`);
@@ -1072,6 +1129,55 @@ document.getElementById("board").addEventListener("submit", (e) => {
   // success. Clearing it eagerly, as before, meant a failed request lost
   // the user's typed text permanently (OpenClaw's review).
   addChecklistItem(Number(form.dataset.taskId), text);
+});
+
+// --- comment interactions -------------------------------------------------
+// Same pending/error/retain-on-failure shape as addChecklistItem above,
+// just posting to /api/tasks/{id}/comment. Author comes from the same
+// shared "Your name" field the task/note/chat composers use (defined
+// further down, near those) -- getAuthorName() is safe to call before its
+// own definition runs since this only executes on a later submit event,
+// well after the whole script has finished evaluating.
+async function addComment(taskId, text) {
+  const author = getAuthorName();
+  if (!author) {
+    commentAddErrors.set(taskId, { text, message: "Enter your name at the top of the page first." });
+    renderBoard();
+    return;
+  }
+  commentAddPending.set(taskId, text);
+  commentAddErrors.delete(taskId);
+  renderBoard();
+  try {
+    const res = await fetch(`/api/tasks/${taskId}/comment`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ author, text }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      commentAddErrors.set(taskId, { text, message: body.error || "Could not add comment." });
+      return;
+    }
+    const task = await fetchTask(taskId);
+    if (task) tasksById.set(task.id, task);
+  } catch {
+    commentAddErrors.set(taskId, { text, message: "Network error -- check your connection and try again." });
+  } finally {
+    commentAddPending.delete(taskId);
+    renderBoard();
+  }
+}
+
+document.getElementById("board").addEventListener("submit", (e) => {
+  const form = e.target.closest(".comment-add");
+  if (!form) return;
+  e.preventDefault();
+  if (form.querySelector('button[aria-disabled="true"]')) return; // already submitting
+  const input = form.querySelector("input");
+  const text = input.value.trim();
+  if (!text) return;
+  addComment(Number(form.dataset.taskId), text);
 });
 
 // --- attachment interactions ---------------------------------------------
