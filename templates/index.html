@@ -249,6 +249,50 @@
   .msg.openclaw .head b { color: var(--claimed); }
   .msg.openclaw .bubble { border-color: color-mix(in srgb, var(--claimed) 40%, var(--border)); }
 
+  /* --- human-facing composers: add task / post note / send chat --------
+     All three POST to REST endpoints the two agents already use (no new
+     backend surface), so styling/behavior mirrors the checklist/attachment
+     forms above: aria-disabled (not disabled) while a submit is in flight,
+     inline error text instead of alert(), never silently swallow a
+     network failure. */
+  .author-field { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
+  .author-field input {
+    padding: 4px 8px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-size: 12.5px; width: 120px;
+  }
+  .board-header-row { display: flex; align-items: center; gap: 8px; margin: 0 0 10px 2px; }
+  .add-toggle {
+    font-size: 11px; font-weight: 600; color: var(--accent); background: none;
+    border: 1px solid var(--border); border-radius: 999px; padding: 2px 10px; cursor: pointer;
+  }
+  .add-toggle:hover, .add-toggle:focus-visible { border-color: var(--accent); }
+  .task-composer { margin-bottom: 14px; }
+  .composer-form { display: flex; flex-direction: column; gap: 8px; }
+  .composer-form input[type="text"], .composer-form textarea, .composer-form select, .composer-form input[type="date"] {
+    padding: 6px 8px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-size: 13px; font-family: inherit;
+  }
+  .composer-form textarea { resize: vertical; min-height: 50px; }
+  .composer-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .composer-form button[type="submit"] {
+    padding: 6px 14px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--accent); color: #fff; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .composer-form button[type="submit"]:hover { opacity: .9; }
+  .composer-form button[aria-disabled="true"] { opacity: .6; cursor: default; }
+  .composer-error { color: var(--blocked); font-size: 12px; }
+  .chat-compose { display: flex; gap: 6px; margin-top: 8px; }
+  .chat-compose input {
+    flex: 1; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-size: 13px;
+  }
+  .chat-compose input[aria-disabled="true"] { opacity: .6; }
+  .chat-compose button {
+    padding: 6px 12px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--accent); color: #fff; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .chat-compose button[aria-disabled="true"] { opacity: .6; cursor: default; }
+
   .history-row {
     display: flex; align-items: center; gap: 8px; padding: 8px 6px; border-radius: 8px;
     font-size: 12.5px; cursor: pointer; border: 1px solid transparent;
@@ -338,6 +382,10 @@
 <header>
   <h1>CollabHub</h1>
   <span class="sub">shared task board + notes &mdash; Claude &amp; OpenClaw</span>
+  <span class="author-field">
+    <label for="authorNameInput">Your name</label>
+    <input type="text" id="authorNameInput" maxlength="60" placeholder="e.g. vishwas" autocomplete="off">
+  </span>
   <form id="searchForm" class="search-form" role="search">
     <input type="search" id="searchInput" placeholder="Search tasks, notes, chat&hellip;" aria-label="Search">
     <button type="submit">Search</button>
@@ -359,7 +407,27 @@
 </div>
 <main>
   <div>
-    <h2 class="clickable" id="boardHeader" style="font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:0 0 10px 2px;display:flex;align-items:center;gap:6px;">Task board <span class="newcount" id="tasksNew" style="display:none;"></span></h2>
+    <div class="board-header-row">
+      <h2 class="clickable" id="boardHeader" style="font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:0;display:flex;align-items:center;gap:6px;">Task board <span class="newcount" id="tasksNew" style="display:none;"></span></h2>
+      <button type="button" id="addTaskToggle" class="add-toggle" aria-expanded="false" aria-controls="taskComposer">+ Add task</button>
+    </div>
+    <div class="panel task-composer" id="taskComposer" hidden>
+      <form id="newTaskForm" class="composer-form">
+        <input type="text" id="newTaskTitle" placeholder="Task title" maxlength="200" aria-label="Task title" autocomplete="off">
+        <textarea id="newTaskDesc" placeholder="Description (optional)" maxlength="4000" aria-label="Task description"></textarea>
+        <div class="composer-row">
+          <select id="newTaskPriority" aria-label="Priority">
+            <option value="low">Low</option>
+            <option value="normal" selected>Normal</option>
+            <option value="high">High</option>
+            <option value="urgent">Urgent</option>
+          </select>
+          <input type="date" id="newTaskDue" aria-label="Due date (optional)">
+          <button type="submit">Add task</button>
+        </div>
+        <div class="composer-error" id="newTaskError" role="alert" style="display:none;"></div>
+      </form>
+    </div>
     <div class="board" id="board"></div>
   </div>
   <div>
@@ -375,14 +443,24 @@
         <button type="button" class="collapse-toggle" data-section-id="panel:notes" data-section-label="Shared notes"
                 aria-controls="notes" aria-expanded="true" aria-label="Collapse Shared notes">&#9662;</button>
       </h2>
+      <form id="newNoteForm" class="composer-form" style="margin-bottom:10px;">
+        <textarea id="newNoteText" placeholder="Post a note&hellip;" maxlength="4000" aria-label="New note text"></textarea>
+        <div class="composer-row"><button type="submit">Post</button></div>
+        <div class="composer-error" id="newNoteError" role="alert" style="display:none;"></div>
+      </form>
       <div id="notes"></div>
     </div>
-    <div class="panel chat-panel" id="chatPanel" style="display:none;">
-      <h2 class="clickable" id="chatHeader">Live chat <span class="chat-status" id="chatStatus"></span> <span class="newcount" id="chatNew" style="display:none;"></span>
+    <div class="panel chat-panel" id="chatPanel">
+      <h2 class="clickable" id="chatHeader">Live chat <span class="chat-status" id="chatStatus" style="display:none;"></span> <span class="newcount" id="chatNew" style="display:none;"></span>
         <button type="button" class="collapse-toggle" data-section-id="panel:chat" data-section-label="Live chat"
                 aria-controls="chatLog" aria-expanded="true" aria-label="Collapse Live chat">&#9662;</button>
       </h2>
       <div class="chat-log" id="chatLog"></div>
+      <form id="chatComposeForm" class="chat-compose">
+        <input type="text" id="chatComposeInput" placeholder="Message&hellip;" maxlength="4000" aria-label="Chat message" autocomplete="off">
+        <button type="submit">Send</button>
+      </form>
+      <div class="composer-error" id="chatComposeError" role="alert" style="display:none;"></div>
     </div>
     <div class="panel" id="historyPanel">
       <h2>Chat history
@@ -1077,6 +1155,204 @@ document.getElementById("board").addEventListener("click", (e) => {
   }
 });
 
+// --- human composers: add task / post note / send chat --------------------
+// All three POST to the same REST endpoints the two agents already use
+// (create_task/post_note/start+send_chat_message's mirrors) -- no new
+// backend surface, so no new security/validation boundary to design here.
+// One shared "author name" field (not one per form) is the load-bearing
+// identity for all three; it's what shows up next to your tasks/notes/chat
+// messages and in the Presence panel, same as "claude"/"openclaw" do.
+
+const AUTHOR_STORAGE_KEY = "collabhub.authorName";
+function getAuthorName() {
+  return (document.getElementById("authorNameInput").value || "").trim();
+}
+(function initAuthorName() {
+  const el = document.getElementById("authorNameInput");
+  try { el.value = localStorage.getItem(AUTHOR_STORAGE_KEY) || ""; } catch { /* private mode / disabled storage -- just start blank */ }
+  el.addEventListener("input", () => {
+    try { localStorage.setItem(AUTHOR_STORAGE_KEY, el.value); } catch { /* not worth surfacing for a display convenience */ }
+  });
+})();
+
+// --- add task ---------------------------------------------------------
+const addTaskToggle = document.getElementById("addTaskToggle");
+const taskComposer = document.getElementById("taskComposer");
+addTaskToggle.addEventListener("click", () => {
+  const opening = taskComposer.hidden;
+  taskComposer.hidden = !opening;
+  addTaskToggle.setAttribute("aria-expanded", String(opening));
+  addTaskToggle.textContent = opening ? "Cancel" : "+ Add task";
+  if (opening) document.getElementById("newTaskTitle").focus();
+});
+
+let newTaskSubmitting = false;
+document.getElementById("newTaskForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (newTaskSubmitting) return;
+  const errEl = document.getElementById("newTaskError");
+  errEl.style.display = "none";
+  const title = document.getElementById("newTaskTitle").value.trim();
+  if (!title) {
+    errEl.textContent = "Title is required.";
+    errEl.style.display = "";
+    return;
+  }
+  const author = getAuthorName();
+  if (!author) {
+    errEl.textContent = "Enter your name at the top of the page first.";
+    errEl.style.display = "";
+    return;
+  }
+  const description = document.getElementById("newTaskDesc").value.trim();
+  const priority = document.getElementById("newTaskPriority").value;
+  const dueDate = document.getElementById("newTaskDue").value || null;
+  newTaskSubmitting = true;
+  const submitBtn = e.target.querySelector('button[type="submit"]');
+  submitBtn.setAttribute("aria-disabled", "true");
+  try {
+    const res = await fetch("/api/tasks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, description, created_by: author, priority, due_date: dueDate }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      errEl.textContent = body.error || "Could not create task.";
+      errEl.style.display = "";
+      return;
+    }
+    // Apply directly from the response rather than waiting on the SSE
+    // task_created event -- that event still arrives and re-applies the
+    // same task (fetchTask by id, idempotent set), but the composer
+    // shouldn't feel like it's waiting on the live connection to work.
+    tasksById.set(body.id, body);
+    renderBoard();
+    e.target.reset();
+    taskComposer.hidden = true;
+    addTaskToggle.setAttribute("aria-expanded", "false");
+    addTaskToggle.textContent = "+ Add task";
+  } catch {
+    errEl.textContent = "Network error -- check your connection and try again.";
+    errEl.style.display = "";
+  } finally {
+    newTaskSubmitting = false;
+    submitBtn.removeAttribute("aria-disabled");
+  }
+});
+
+// --- post note ----------------------------------------------------------
+let newNoteSubmitting = false;
+document.getElementById("newNoteForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (newNoteSubmitting) return;
+  const errEl = document.getElementById("newNoteError");
+  errEl.style.display = "none";
+  const textEl = document.getElementById("newNoteText");
+  const text = textEl.value.trim();
+  if (!text) return;
+  const author = getAuthorName();
+  if (!author) {
+    errEl.textContent = "Enter your name at the top of the page first.";
+    errEl.style.display = "";
+    return;
+  }
+  newNoteSubmitting = true;
+  const submitBtn = e.target.querySelector('button[type="submit"]');
+  submitBtn.setAttribute("aria-disabled", "true");
+  try {
+    const res = await fetch("/api/notes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ author, text }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      errEl.textContent = body.error || "Could not post note.";
+      errEl.style.display = "";
+      return;
+    }
+    const note = await res.json();
+    notesById.set(note.id, note);
+    renderNotes();
+    textEl.value = "";
+  } catch {
+    errEl.textContent = "Network error -- check your connection and try again.";
+    errEl.style.display = "";
+  } finally {
+    newNoteSubmitting = false;
+    submitBtn.removeAttribute("aria-disabled");
+  }
+});
+
+// --- send chat message ---------------------------------------------------
+// Chat has a single-active-session model (agents start/end sessions
+// explicitly). Sending here silently starts a session if none is active --
+// start_chat_session is idempotent (returns the already-active one if
+// there is one), so this is safe to call unconditionally rather than
+// racing a client-side "is one active" check against the server.
+let chatSendSubmitting = false;
+document.getElementById("chatComposeForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (chatSendSubmitting) return;
+  const errEl = document.getElementById("chatComposeError");
+  errEl.style.display = "none";
+  const input = document.getElementById("chatComposeInput");
+  const text = input.value.trim();
+  if (!text) return;
+  const author = getAuthorName();
+  if (!author) {
+    errEl.textContent = "Enter your name at the top of the page first.";
+    errEl.style.display = "";
+    return;
+  }
+  chatSendSubmitting = true;
+  const submitBtn = e.target.querySelector('button[type="submit"]');
+  submitBtn.setAttribute("aria-disabled", "true");
+  input.setAttribute("aria-disabled", "true");
+  try {
+    const prevSessionId = activeSession ? activeSession.id : null;
+    let session = activeSession;
+    if (!session || session.status !== "active") {
+      const startRes = await fetch("/api/chat/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ started_by: author }),
+      });
+      if (!startRes.ok) throw new Error("start failed");
+      session = await startRes.json();
+      if (session.id !== prevSessionId) chatMessagesById = new Map(); // a genuinely different session than whatever we last had
+      activeSession = session;
+      renderChat();
+    }
+    const sendRes = await fetch("/api/chat/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: session.id, author, text }),
+    });
+    if (!sendRes.ok) {
+      // The session ended between start and send (a race with the other
+      // agent) -- surface it rather than silently dropping the message;
+      // the next send attempt will start a fresh session on its own.
+      errEl.textContent = "Could not send -- the session may have just ended. Try again.";
+      errEl.style.display = "";
+      return;
+    }
+    const msg = await sendRes.json();
+    chatMessagesById.set(msg.id, msg);
+    chatAtBottom = true;
+    renderChat();
+    input.value = "";
+  } catch {
+    errEl.textContent = "Network error -- check your connection and try again.";
+    errEl.style.display = "";
+  } finally {
+    chatSendSubmitting = false;
+    submitBtn.removeAttribute("aria-disabled");
+    input.removeAttribute("aria-disabled");
+  }
+});
+
 function renderNotes() {
   const notes = [...notesById.values()].sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
   document.getElementById("notes").innerHTML = notes.length
@@ -1090,8 +1366,11 @@ function renderNotes() {
 }
 
 function renderChat() {
+  // The panel itself is always visible now -- it doubles as the compose
+  // entry point ("send a message to start a chat"), not just a viewer for
+  // a session an agent already started (tranche: human composers). Only the
+  // log content and status badge vary with activeSession.
   const panel = document.getElementById("chatPanel");
-  if (!activeSession) { panel.style.display = "none"; return; }
   panel.style.display = "";
 
   const log = document.getElementById("chatLog");
@@ -1105,17 +1384,29 @@ function renderChat() {
     chatAtBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 30;
   }
 
-  // "No active chat" (structural, style.display on the whole panel) and
   // "collapsed by user preference" (the hidden attribute on #chatLog alone,
-  // from applySectionCollapse) are deliberately independent -- a
+  // from applySectionCollapse) stays independent of session state -- a
   // newly-started session must reappear honoring whatever collapse state
   // was last chosen for it, never forced back open just because it
-  // structurally exists again (OpenClaw's review).
+  // structurally exists again (OpenClaw's review). The compose form sits
+  // outside #chatLog, so it stays usable even while the log is collapsed --
+  // same choice as the notes composer.
   applySectionCollapse("panel:chat");
 
   const statusEl = document.getElementById("chatStatus");
-  statusEl.textContent = activeSession.status;
-  statusEl.className = "chat-status " + activeSession.status;
+  if (activeSession) {
+    statusEl.style.display = "";
+    statusEl.textContent = activeSession.status;
+    statusEl.className = "chat-status " + activeSession.status;
+  } else {
+    statusEl.style.display = "none";
+  }
+
+  if (!activeSession) {
+    log.innerHTML = `<div class="empty">No active chat &mdash; send a message below to start one.</div>`;
+    renderNewCount("chat");
+    return;
+  }
 
   const msgs = [...chatMessagesById.values()].sort((a, b) => a.id - b.id);
   log.innerHTML = msgs.length
