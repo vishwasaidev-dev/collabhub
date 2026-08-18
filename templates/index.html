@@ -97,6 +97,17 @@
   .due-date { display: inline-flex; align-items: center; gap: 3px; }
   .due-date.overdue { color: var(--blocked); font-weight: 600; }
   .due-date.overdue::before { content: "⚠"; } /* icon, not color alone, marks overdue -- OpenClaw's review */
+  .task-complete { margin-top: 8px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .task-complete-btn {
+    font-size: 12px; padding: 3px 8px; border-radius: 6px; border: 1px solid var(--done);
+    background: none; color: var(--done); cursor: pointer; font-weight: 600;
+  }
+  .task-complete-btn[aria-disabled="true"] { opacity: .6; cursor: default; }
+  .task-complete-error { font-size: 11px; color: var(--blocked); }
+  .task-complete-retry {
+    font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--blocked);
+    background: none; color: var(--blocked); cursor: pointer; margin-left: 4px;
+  }
   .checklist { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 6px; }
   .checklist-progress { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
   .checklist-items { max-height: 160px; overflow-y: auto; display: flex; flex-direction: column; gap: 3px; }
@@ -588,6 +599,13 @@ let attachmentDeleteErrors = new Map();
 // on-failure shape as checklistAddPending/checklistAddErrors above).
 let commentAddPending = new Map();
 let commentAddErrors = new Map();
+// taskId -> true while a "Mark done" request is in flight (same shape as
+// pendingAttachmentDeletes above -- disables the button, no optimistic
+// status flip, a fresh fetchTask() on success is what actually moves the
+// card to the Done column).
+let taskCompletePending = new Set();
+// taskId -> error message for a failed "Mark done" attempt.
+let taskCompleteErrors = new Map();
 
 // --- collapsible sections (board columns + sidebar panels) ----------------
 // Persisted as a JSON array of section ids under one localStorage key,
@@ -860,6 +878,19 @@ function commentsHtml(t) {
     </div>`;
 }
 
+function taskCompleteHtml(t) {
+  if (t.status === "done") return "";
+  const busy = taskCompletePending.has(t.id);
+  const err = taskCompleteErrors.get(t.id);
+  return `
+    <div class="task-complete">
+      <button type="button" class="task-complete-btn" data-task-id="${t.id}"
+              ${busy ? 'aria-disabled="true"' : ""}>${busy ? "Marking done…" : "Mark done"}</button>
+      ${err ? `<span class="task-complete-error" role="alert">${esc(err.message)}
+        <button type="button" class="task-complete-retry" data-task-id="${t.id}">Retry</button></span>` : ""}
+    </div>`;
+}
+
 function taskCard(t) {
   const overdue = t.due_date && t.status !== "done" && isOverdue(t.due_date);
   return `
@@ -874,6 +905,7 @@ function taskCard(t) {
         <span>by ${esc(t.created_by || "?")}</span>
         <time>${fmtTime(t.updated_at)}</time>
       </div>
+      ${taskCompleteHtml(t)}
       ${checklistHtml(t)}
       ${attachmentsHtml(t)}
       ${commentsHtml(t)}
@@ -1259,6 +1291,65 @@ document.getElementById("board").addEventListener("click", (e) => {
     if (!confirm(`Delete this attachment?\n\n${filename}`)) return;
     deleteAttachment(Number(delBtn.dataset.taskId), Number(delBtn.dataset.attachmentId));
   }
+});
+
+// --- task completion -------------------------------------------------------
+// Lets the human close a task straight from the dashboard -- previously the
+// only way was asking one of the agents to call complete_task on your
+// behalf. Posts to the same /api/tasks/{id}/complete route the MCP tool and
+// its REST mirror already use, so no new backend surface. getAuthorName()
+// is defined further down (safe -- this only runs on a later click, well
+// after the whole script has evaluated, same as addComment above).
+
+async function completeTask(taskId, summary) {
+  taskCompletePending.add(taskId);
+  taskCompleteErrors.delete(taskId);
+  renderBoard();
+  try {
+    const author = getAuthorName();
+    const res = await fetch(`/api/tasks/${taskId}/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ author, summary }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      taskCompleteErrors.set(taskId, { summary, message: body.error || "Could not mark this task done." });
+      return;
+    }
+    const task = await fetchTask(taskId);
+    if (task) tasksById.set(task.id, task);
+  } catch {
+    taskCompleteErrors.set(taskId, { summary, message: "Network error -- check your connection and try again." });
+  } finally {
+    taskCompletePending.delete(taskId);
+    renderBoard();
+  }
+}
+
+document.getElementById("board").addEventListener("click", (e) => {
+  const retryBtn = e.target.closest(".task-complete-retry");
+  if (retryBtn) {
+    const taskId = Number(retryBtn.dataset.taskId);
+    const err = taskCompleteErrors.get(taskId);
+    completeTask(taskId, err ? err.summary : "");
+    return;
+  }
+  const btn = e.target.closest(".task-complete-btn");
+  if (!btn) return;
+  if (btn.getAttribute("aria-disabled") === "true") return; // already in flight
+  const taskId = Number(btn.dataset.taskId);
+  if (!getAuthorName()) {
+    taskCompleteErrors.set(taskId, { summary: "", message: "Enter your name at the top of the page first." });
+    renderBoard();
+    return;
+  }
+  // prompt() doubles as the confirm-before-an-action-you-can't-undo-from-
+  // here step (same reasoning as the attachment/checklist delete confirms)
+  // -- Cancel returns null and aborts, OK with an empty note still proceeds.
+  const note = prompt(`Mark task #${taskId} as done?\n\nOptional closing note (leave blank for none):`);
+  if (note === null) return;
+  completeTask(taskId, note.trim());
 });
 
 // --- human composers: add task / post note / send chat --------------------

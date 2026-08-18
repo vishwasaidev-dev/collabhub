@@ -563,6 +563,29 @@ def _hydrate_comments(conn: sqlite3.Connection, tasks: list[dict]) -> None:
         t["comments"] = by_task.get(t["id"], [])
 
 
+def _hydrate_comment_counts(conn: sqlite3.Connection, tasks: list[dict]) -> None:
+    """Lighter sibling of _hydrate_comments, for list_tasks() only: a count
+    instead of the full thread. Comment text is free-form and unbounded --
+    on a board where individual comments can run to several KB (a pasted
+    design JSON, a long writeup), hydrating every comment on every task in
+    a multi-task listing is exactly what turns a routine list call into a
+    response too large for a calling agent's own tool budget. get_task(id)
+    remains the way to read one task's actual comment thread; full_state()
+    intentionally keeps full comments (the dashboard renders them inline on
+    every card, not just on demand)."""
+    if not tasks:
+        return
+    task_ids = [t["id"] for t in tasks]
+    placeholders = ",".join("?" * len(task_ids))
+    rows = conn.execute(
+        f"SELECT task_id, COUNT(*) AS n FROM comments WHERE task_id IN ({placeholders}) GROUP BY task_id",
+        task_ids,
+    ).fetchall()
+    counts = {r["task_id"]: r["n"] for r in rows}
+    for t in tasks:
+        t["comment_count"] = counts.get(t["id"], 0)
+
+
 def create_task(
     title: str, description: str = "", created_by: str = "", tags: list[str] | None = None,
     priority: str = "normal", due_date: str | None = None,
@@ -592,9 +615,29 @@ def create_task(
 
 
 def list_tasks(status: str | None = None, assignee: str | None = None) -> list[dict]:
+    """List tasks, lightest-weight shape first.
+
+    status omitted defaults to the non-done statuses (open/claimed/
+    in_progress/blocked) -- "the board" in normal use means the work still
+    outstanding, not the full history, and a board that accumulates dozens
+    of done tasks over time would otherwise make every unfiltered call
+    bigger indefinitely. Pass status="all" for every status including done,
+    or an exact status (including "done") to filter to just that one.
+
+    Comments are summarized as comment_count (an int) rather than hydrated
+    in full here -- see _hydrate_comment_counts. Call get_task(task_id) for
+    one task's actual comment thread; checklist items and attachment
+    metadata are still included in full (small, bounded fields, and
+    get_task/full_state/list_tasks staying consistent on those specifically
+    is a tested invariant -- see test_checklist_hydration_is_consistent_
+    across_task_shapes)."""
+    if status is not None and status != "all" and status not in VALID_STATUSES:
+        raise ValueError(f"invalid status {status!r}; must be 'all' or one of {VALID_STATUSES}")
     q = "SELECT * FROM tasks"
     clauses, params = [], []
-    if status:
+    if status is None:
+        clauses.append("status!='done'")
+    elif status != "all":
         clauses.append("status=?")
         params.append(status)
     if assignee:
@@ -608,7 +651,7 @@ def list_tasks(status: str | None = None, assignee: str | None = None) -> list[d
         tasks = [_task_row_to_dict(r) for r in rows]
         _hydrate_checklists(conn, tasks)
         _hydrate_attachments(conn, tasks)
-        _hydrate_comments(conn, tasks)
+        _hydrate_comment_counts(conn, tasks)
         return tasks
 
 

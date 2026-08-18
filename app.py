@@ -74,8 +74,12 @@ def create_task_tool(
 
 
 @mcp.tool(name="list_tasks", description=(
-    "List shared tasks, optionally filtered by status (open/claimed/in_progress/blocked/done) "
-    "and/or assignee. Call with no filters to see the whole board."
+    "List shared tasks. With no status given, defaults to just the non-done ones "
+    "(open/claimed/in_progress/blocked) in a lightweight shape -- comments are a "
+    "comment_count, not the full thread (call get_task(task_id) for that); checklist "
+    "items and attachment metadata are still included in full. Pass status=\"all\" for "
+    "every status including done, or an exact status (open/claimed/in_progress/blocked/"
+    "done) to filter to just that one. assignee filters on top of either."
 ))
 def list_tasks_tool(status: str | None = None, assignee: str | None = None) -> list[dict]:
     return storage.list_tasks(status, assignee)
@@ -554,9 +558,12 @@ async def task_unlink_session(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 async def tasks_list(request: Request) -> JSONResponse:
-    return JSONResponse(storage.list_tasks(
-        request.query_params.get("status"), request.query_params.get("assignee")
-    ))
+    try:
+        return JSONResponse(storage.list_tasks(
+            request.query_params.get("status"), request.query_params.get("assignee")
+        ))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 async def tasks_create(request: Request) -> JSONResponse:
@@ -920,8 +927,16 @@ async def task_comment(request: Request) -> JSONResponse:
 async def task_complete(request: Request) -> JSONResponse:
     body = await request.json()
     task_id = int(request.path_params["task_id"])
-    if body.get("summary"):
-        storage.add_comment(task_id, body.get("author", ""), body["summary"])
+    author = body.get("author", "")
+    summary = body.get("summary") or ""
+    # Unlike the MCP complete_task tool (agents always pass a real summary,
+    # per its own description), the dashboard's "Mark done" button lets the
+    # closing note be blank. Still record who closed it -- an attributed
+    # default beats a completion with no comment and no way to tell who
+    # did it later.
+    comment_text = summary or (f"Marked done by {author}." if author else "")
+    if comment_text:
+        storage.add_comment(task_id, author, comment_text)
     task = storage.update_task(task_id, status="done")
     if task is None:
         return JSONResponse({"error": "task not found"}, status_code=404)
